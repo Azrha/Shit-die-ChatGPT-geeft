@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="autolab"
+PORT="8844"
+
+mkdir -p "$APP_DIR"/{app,app/static,data}
+
+cat > "$APP_DIR/README.md" <<'MD'
+# AutoLab — Self-Running Experiment Lab (local-first)
+
+## Run
+~~~bash
+docker compose up --build
+~~~
+Open: http://localhost:8844
+
+## Core idea
+- A **Study** defines:
+  - `workdir` (inside container; default `/data/work`)
+  - a `command_template` like: `python train.py --lr {lr} --seed {seed}`
+  - `params` (grid): `{ "lr":[0.001,0.01], "seed":[1,2,3] }`
+- AutoLab expands the grid to **Trials**, runs them, and stores:
+  - stdout/stderr, exit code, duration
+  - params resolved
+  - metrics parsed from either:
+    - a file `metrics.json` in the trial working directory, OR
+    - a stdout line starting with `METRICS:` followed by JSON
+
+## Minimal example (inside /data/work)
+Create `/data/work/train.py`:
+~~~python
+import json, argparse, time, random
+p=argparse.ArgumentParser()
+p.add_argument("--lr", type=float, required=True)
+p.add_argument("--seed", type=int, required=True)
+a=p.parse_args()
+random.seed(a.seed)
+time.sleep(1)
+score = 1.0/(1.0 + abs(a.lr-0.01)) + random.random()*0.01
+print("METRICS:", json.dumps({"score": score, "lr": a.lr, "seed": a.seed}))
+with open("metrics.json","w") as f:
+    json.dump({"score": score}, f)
+~~~
+
+Then in UI:
+- workdir: `/data/work`
+- command: `python train.py --lr {lr} --seed {seed}`
+- params: `{"lr":[0.001,0.01,0.1],"seed":[1,2,3,4]}`
+
+Run the study; browse trials + metrics.
+MD
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  autolab:
+    build: .
+    environment:
+      DATA_DIR: /data
+      AUTOLAB_DB: /data/autolab.sqlite3
+      AUTOLAB_WORK_ROOT: /data/work
+    volumes:
+      - ./data:/data
+    ports:
+      - "${PORT}:8000"
+EOF
+
+cat > "$APP_DIR/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+PyYAML==6.0.2
+REQ
+
+cat > "$APP_DIR/app/db.py" <<'PY'
+import os
+import sqlite3
+from pathlib import Path
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+DB_PATH = Path(os.getenv("AUTOLAB_DB", str(DATA_DIR / "autolab.sqlite3"))).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def connect() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
+    return c
+
+def init_db() -> None:
+    with connect() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS studies (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          workdir TEXT NOT NULL,
+          command_template TEXT NOT NULL,
+          params_yaml TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trials (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          study_id INTEGER NOT NULL,
+          trial_index INTEGER NOT NULL,
+          params_json TEXT NOT NULL,
+          command TEXT NOT NULL,
+          status TEXT NOT NULL, -- queued|running|done|failed
+          exit_code INTEGER,
+          started_at TEXT,
+          finished_at TEXT,
+          seconds REAL,
+          stdout_path TEXT,
+          stderr_path TEXT,
+          metrics_json TEXT,
+          artifact_dir TEXT,
+          FOREIGN KEY(study_id) REFERENCES studies(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trials_study ON trials(study_id, trial_index);
+        CREATE INDEX IF NOT EXISTS idx_trials_status ON trials(status);
+        """)
+PY
+
+cat > "$APP_DIR/app/util.py" <<'PY'
+import json
+import itertools
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Iterable
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def expand_grid(params: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    keys = list(params.keys())
+    values = [params[k] for k in keys]
+    out = []
+    for combo in itertools.product(*values):
+        out.append({k: v for k, v in zip(keys, combo)})
+    return out
+
+def safe_name(s: str) -> str:
+    s = "".join(ch for ch in (s or "") if ch.isalnum() or ch in ("-","_","."," "))
+    s = s.strip()
+    return s or "study"
+
+def json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False)
+
+def json_loads(s: str) -> Any:
+    return json.loads(s)
+PY
+
+cat > "$APP_DIR/app/runner.py" <<'PY'
+import os
+import json
+import time
+import shlex
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+
+from .db import connect
+from .util import utc_iso, json_dumps, json_loads
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+WORK_ROOT = Path(os.getenv("AUTOLAB_WORK_ROOT", str(DATA_DIR / "work"))).resolve()
+TRIALS_DIR = DATA_DIR / "trials"
+TRIALS_DIR.mkdir(parents=True, exist_ok=True)
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
+
+def _trial_paths(trial_id: int) -> Tuple[Path, Path, Path]:
+    tdir = TRIALS_DIR / f"trial_{trial_id:08d}"
+    tdir.mkdir(parents=True, exist_ok=True)
+    stdout = tdir / "stdout.log"
+    stderr = tdir / "stderr.log"
+    artifacts = tdir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    return stdout, stderr, artifacts
+
+def _parse_metrics(stdout_path: Path, workdir: Path) -> Dict[str, Any]:
+    # Prefer metrics.json if present
+    mj = workdir / "metrics.json"
+    if mj.exists():
+        try:
+            return json.loads(mj.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Fallback: scan for "METRICS: {json}"
+    try:
+        for line in stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()[::-1]:
+            if line.strip().startswith("METRICS:"):
+                payload = line.split("METRICS:", 1)[1].strip()
+                return json.loads(payload)
+    except Exception:
+        pass
+    return {}
+
+def run_one(trial_id: int) -> None:
+    with connect() as conn:
+        t = conn.execute("SELECT * FROM trials WHERE id=?", (trial_id,)).fetchone()
+        if not t:
+            return
+        if t["status"] not in ("queued",):
+            return
+        s = conn.execute("SELECT * FROM studies WHERE id=?", (t["study_id"],)).fetchone()
+        if not s:
+            conn.execute("UPDATE trials SET status='failed' WHERE id=?", (trial_id,))
+            return
+
+        conn.execute("UPDATE trials SET status='running', started_at=? WHERE id=?", (utc_iso(), trial_id))
+
+    stdout_path, stderr_path, artifacts_dir = _trial_paths(trial_id)
+
+    # Use the study workdir as base; trial runs in an isolated temp workdir under artifacts to avoid collisions
+    study_workdir = Path(s["workdir"]).resolve()
+    trial_workdir = artifacts_dir / "workdir"
+    trial_workdir.mkdir(parents=True, exist_ok=True)
+
+    # Copy workdir content into trial workdir (shallow, but sufficient for typical scripts)
+    # NOTE: no placeholders; best-effort copy
+    try:
+        if study_workdir.exists():
+            for p in study_workdir.rglob("*"):
+                rel = p.relative_to(study_workdir)
+                dst = trial_workdir / rel
+                if p.is_dir():
+                    dst.mkdir(parents=True, exist_ok=True)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(p.read_bytes())
+    except Exception:
+        pass
+
+    cmd = t["command"]
+    t0 = time.time()
+    exit_code = None
+    try:
+        with stdout_path.open("w", encoding="utf-8") as out, stderr_path.open("w", encoding="utf-8") as err:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(trial_workdir),
+                shell=True,
+                stdout=out,
+                stderr=err,
+                env=dict(os.environ),
+            )
+            exit_code = proc.wait()
+    except Exception:
+        exit_code = 999
+
+    seconds = round(time.time() - t0, 3)
+    metrics = _parse_metrics(stdout_path, trial_workdir)
+
+    status = "done" if exit_code == 0 else "failed"
+    with connect() as conn:
+        conn.execute("""
+          UPDATE trials
+          SET status=?, exit_code=?, finished_at=?, seconds=?,
+              stdout_path=?, stderr_path=?, metrics_json=?, artifact_dir=?
+          WHERE id=?
+        """, (
+            status, exit_code, utc_iso(), seconds,
+            str(stdout_path), str(stderr_path), json_dumps(metrics), str(artifacts_dir),
+            trial_id
+        ))
+PY
+
+cat > "$APP_DIR/app/queue.py" <<'PY'
+import threading
+import time
+from typing import Optional
+
+from .db import connect
+from .runner import run_one
+
+class Worker:
+    def __init__(self):
+        self._t: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def start(self):
+        if self._t and self._t.is_alive():
+            return
+        self._stop.clear()
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            tid = None
+            with connect() as conn:
+                row = conn.execute("SELECT id FROM trials WHERE status='queued' ORDER BY id ASC LIMIT 1").fetchone()
+                if row:
+                    tid = int(row["id"])
+            if tid is None:
+                time.sleep(0.5)
+                continue
+            run_one(tid)
+
+worker = Worker()
+PY
+
+cat > "$APP_DIR/app/main.py" <<'PY'
+import os
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+import yaml
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from .db import init_db, connect
+from .util import utc_iso, safe_name, expand_grid, json_dumps, json_loads
+from .queue import worker
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+WORK_ROOT = Path(os.getenv("AUTOLAB_WORK_ROOT", str(DATA_DIR / "work"))).resolve()
+
+init_db()
+app = FastAPI(title="AutoLab")
+BASE = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+
+@app.on_event("startup")
+def _startup():
+    worker.start()
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return (BASE / "static" / "index.html").read_text(encoding="utf-8")
+
+class StudyReq(BaseModel):
+    name: str = Field(..., min_length=1)
+    workdir: str = Field(default=str(WORK_ROOT))
+    command_template: str = Field(..., min_length=1)
+    params: Dict[str, list] = Field(default_factory=dict)
+
+@app.post("/api/studies")
+def create_study(req: StudyReq):
+    name = safe_name(req.name)
+    workdir = str(Path(req.workdir).resolve())
+    cmd_t = req.command_template.strip()
+    params = req.params or {}
+
+    # Validate: params must be lists
+    for k, v in params.items():
+        if not isinstance(v, list) or len(v) == 0:
+            raise HTTPException(400, f"params.{k} must be a non-empty list")
+
+    params_yaml = yaml.safe_dump(params, sort_keys=True, allow_unicode=True)
+
+    with connect() as conn:
+        cur = conn.execute("""
+          INSERT INTO studies(name, workdir, command_template, params_yaml, created_at)
+          VALUES (?,?,?,?,?)
+        """, (name, workdir, cmd_t, params_yaml, utc_iso()))
+        sid = int(cur.lastrowid)
+
+    return {"id": sid, "name": name}
+
+@app.get("/api/studies")
+def list_studies(limit: int = 100):
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM studies ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    out = []
+    for r in rows:
+        out.append(dict(r))
+    return {"studies": out}
+
+@app.post("/api/studies/{study_id}/enqueue")
+def enqueue_trials(study_id: int):
+    with connect() as conn:
+        s = conn.execute("SELECT * FROM studies WHERE id=?", (study_id,)).fetchone()
+        if not s:
+            raise HTTPException(404, "study not found")
+        params = yaml.safe_load(s["params_yaml"]) or {}
+        grid = expand_grid(params) if params else [{}]
+
+        created = 0
+        for i, p in enumerate(grid):
+            try:
+                cmd = s["command_template"].format(**p)
+            except KeyError as e:
+                raise HTTPException(400, f"missing placeholder in command_template: {e}")
+
+            conn.execute("""
+              INSERT INTO trials(study_id, trial_index, params_json, command, status)
+              VALUES (?,?,?,?, 'queued')
+            """, (study_id, i, json_dumps(p), cmd, "queued"))
+            created += 1
+
+    return {"queued": created}
+
+@app.get("/api/studies/{study_id}/trials")
+def list_trials(study_id: int, limit: int = 200):
+    with connect() as conn:
+        rows = conn.execute("""
+          SELECT id, trial_index, status, exit_code, seconds, params_json, command, metrics_json
+          FROM trials
+          WHERE study_id=?
+          ORDER BY trial_index ASC
+          LIMIT ?
+        """, (study_id, limit)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["params"] = json_loads(d.pop("params_json"))
+        d["metrics"] = json_loads(d["metrics_json"]) if d.get("metrics_json") else {}
+        out.append(d)
+    return {"trials": out}
+
+@app.get("/api/trials/{trial_id}")
+def get_trial(trial_id: int):
+    with connect() as conn:
+        t = conn.execute("SELECT * FROM trials WHERE id=?", (trial_id,)).fetchone()
+        if not t:
+            raise HTTPException(404, "trial not found")
+    d = dict(t)
+    d["params"] = json_loads(d.pop("params_json"))
+    d["metrics"] = json_loads(d["metrics_json"]) if d.get("metrics_json") else {}
+    return d
+
+@app.get("/api/trials/{trial_id}/log/{stream}")
+def get_log(trial_id: int, stream: str):
+    if stream not in ("stdout", "stderr"):
+        raise HTTPException(400, "stream must be stdout|stderr")
+    with connect() as conn:
+        t = conn.execute("SELECT stdout_path, stderr_path FROM trials WHERE id=?", (trial_id,)).fetchone()
+        if not t:
+            raise HTTPException(404, "trial not found")
+    p = Path(t["stdout_path"] if stream == "stdout" else t["stderr_path"])
+    if not p.exists():
+        return {"text": ""}
+    return {"text": p.read_text(encoding="utf-8", errors="replace")}
+
+@app.get("/api/trials/{trial_id}/artifacts")
+def list_artifacts(trial_id: int):
+    with connect() as conn:
+        t = conn.execute("SELECT artifact_dir FROM trials WHERE id=?", (trial_id,)).fetchone()
+        if not t:
+            raise HTTPException(404, "trial not found")
+    ad = Path(t["artifact_dir"] or "")
+    if not ad.exists():
+        return {"files": []}
+    files = []
+    for p in ad.rglob("*"):
+        if p.is_file():
+            files.append(str(p.relative_to(ad)))
+    return {"files": sorted(files)}
+
+@app.get("/api/trials/{trial_id}/artifact")
+def download_artifact(trial_id: int, path: str):
+    with connect() as conn:
+        t = conn.execute("SELECT artifact_dir FROM trials WHERE id=?", (trial_id,)).fetchone()
+        if not t:
+            raise HTTPException(404, "trial not found")
+    ad = Path(t["artifact_dir"] or "")
+    if not ad.exists():
+        raise HTTPException(404, "no artifacts")
+    rel = Path(path)
+    # prevent traversal
+    if ".." in rel.parts or rel.is_absolute():
+        raise HTTPException(400, "bad path")
+    fp = (ad / rel).resolve()
+    if not str(fp).startswith(str(ad.resolve())) or not fp.exists() or not fp.is_file():
+        raise HTTPException(404, "not found")
+    return FileResponse(str(fp), filename=fp.name)
+PY
+
+cat > "$APP_DIR/app/static/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>AutoLab</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    input,select,button,textarea{font-size:14px;padding:10px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:14px;margin:14px 0}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .muted{color:#666}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:8px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left;vertical-align:top}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
+    a{cursor:pointer}
+  </style>
+</head>
+<body>
+  <h1>AutoLab</h1>
+  <p class="muted">Studies → trials → reproducible runs with logs, metrics, artifacts.</p>
+
+  <div class="card">
+    <h3>1) Create Study</h3>
+    <div class="row">
+      <input id="name" placeholder="name" style="flex:1;min-width:240px"/>
+      <input id="workdir" placeholder="workdir (inside container) e.g. /data/work" style="flex:2;min-width:320px"/>
+    </div>
+    <div class="row">
+      <input id="cmd" placeholder="command template e.g. python train.py --lr {lr} --seed {seed}" style="flex:1;min-width:520px"/>
+    </div>
+    <div class="row">
+      <textarea id="params" style="width:100%;height:140px" placeholder='params JSON e.g. {"lr":[0.001,0.01],"seed":[1,2,3]}'></textarea>
+    </div>
+    <button onclick="createStudy()">Create</button>
+    <div id="cstatus" class="muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>2) Studies</h3>
+    <button onclick="loadStudies()">Refresh</button>
+    <div id="studies"></div>
+  </div>
+
+  <div class="card">
+    <h3>3) Trials</h3>
+    <div class="row">
+      <input id="sid" placeholder="study_id" style="min-width:180px"/>
+      <button onclick="enqueue()">Enqueue grid trials</button>
+      <button onclick="loadTrials()">Load trials</button>
+    </div>
+    <div id="tstatus" class="muted"></div>
+    <div id="trials"></div>
+  </div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+
+async function createStudy(){
+  $("cstatus").textContent = "Creating…";
+  let params = {};
+  try{ params = JSON.parse($("params").value || "{}"); } catch(e){ $("cstatus").textContent="params JSON invalid"; return; }
+  const body = {
+    name: $("name").value || "study",
+    workdir: $("workdir").value || "/data/work",
+    command_template: $("cmd").value || "",
+    params
+  };
+  const r = await fetch("/api/studies", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  const j = await r.json().catch(()=>({}));
+  $("cstatus").textContent = r.ok ? ("OK study_id=" + j.id) : ("Error: " + (j.detail||r.status));
+  if(r.ok){ $("sid").value = j.id; await loadStudies(); }
+}
+
+async function loadStudies(){
+  const r = await fetch("/api/studies");
+  const j = await r.json().catch(()=>({}));
+  const arr = j.studies || [];
+  const div = $("studies");
+  div.innerHTML = "";
+  for(const s of arr){
+    const c = document.createElement("div");
+    c.className = "card";
+    c.innerHTML = `
+      <div><b>ID ${s.id}</b> — ${esc(s.name)}</div>
+      <div class="muted">workdir: <code>${esc(s.workdir)}</code></div>
+      <div class="muted">cmd: <code>${esc(s.command_template)}</code></div>
+      <div class="muted">created: ${esc(s.created_at)}</div>
+      <button onclick="useStudy(${s.id})">Use</button>
+    `;
+    div.appendChild(c);
+  }
+}
+
+function useStudy(id){ $("sid").value = id; loadTrials(); }
+
+async function enqueue(){
+  const sid = Number($("sid").value||"0");
+  if(!sid){ $("tstatus").textContent="set study_id"; return; }
+  $("tstatus").textContent = "Enqueueing…";
+  const r = await fetch(`/api/studies/${sid}/enqueue`, {method:"POST"});
+  const j = await r.json().catch(()=>({}));
+  $("tstatus").textContent = r.ok ? ("OK queued: " + j.queued) : ("Error: " + (j.detail||r.status));
+  await loadTrials();
+}
+
+async function loadTrials(){
+  const sid = Number($("sid").value||"0");
+  if(!sid){ return; }
+  const r = await fetch(`/api/studies/${sid}/trials`);
+  const j = await r.json().catch(()=>({}));
+  const arr = j.trials || [];
+  const div = $("trials");
+  div.innerHTML = "";
+
+  const t = document.createElement("table");
+  t.innerHTML = `<thead><tr>
+    <th>trial</th><th>status</th><th>exit</th><th>seconds</th><th>params</th><th>metrics</th><th>logs</th><th>artifacts</th>
+  </tr></thead>`;
+  const tb = document.createElement("tbody");
+
+  for(const it of arr){
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>#${it.trial_index}<div class="muted">id:${it.id}</div></td>
+      <td>${esc(it.status)}</td>
+      <td>${it.exit_code ?? ""}</td>
+      <td>${it.seconds ?? ""}</td>
+      <td><pre>${esc(JSON.stringify(it.params, null, 2))}</pre></td>
+      <td><pre>${esc(JSON.stringify(it.metrics||{}, null, 2))}</pre></td>
+      <td>
+        <a onclick="showLog(${it.id},'stdout')">stdout</a> |
+        <a onclick="showLog(${it.id},'stderr')">stderr</a>
+        <pre id="log_${it.id}"></pre>
+      </td>
+      <td>
+        <a onclick="listArtifacts(${it.id})">list</a>
+        <div id="arts_${it.id}"></div>
+      </td>
+    `;
+    tb.appendChild(tr);
+  }
+  t.appendChild(tb);
+  div.appendChild(t);
+
+  // auto-refresh while there are queued/running trials
+  if(arr.some(x=>x.status==='queued' || x.status==='running')){
+    setTimeout(loadTrials, 1200);
+  }
+}
+
+async function showLog(id, stream){
+  const r = await fetch(`/api/trials/${id}/log/${stream}`);
+  const j = await r.json().catch(()=>({}));
+  $(`log_${id}`).textContent = j.text || "";
+}
+
+async function listArtifacts(id){
+  const r = await fetch(`/api/trials/${id}/artifacts`);
+  const j = await r.json().catch(()=>({}));
+  const files = j.files || [];
+  const div = $(`arts_${id}`);
+  div.innerHTML = "";
+  for(const f of files){
+    const a = document.createElement("a");
+    a.textContent = f;
+    a.href = `/api/trials/${id}/artifact?path=` + encodeURIComponent(f);
+    a.target = "_blank";
+    div.appendChild(a);
+    div.appendChild(document.createElement("br"));
+  }
+}
+
+function esc(s){ return String(s??"").replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+$("workdir").value = "/data/work";
+loadStudies();
+</script>
+</body>
+</html>
+HTML
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Open:"
+echo "  http://localhost:${PORT}"
+echo
+echo "Workdir on host:"
+echo "  Put your experiment project under ./${APP_DIR}/data/work"
+echo "  Then use /data/work in the UI"
