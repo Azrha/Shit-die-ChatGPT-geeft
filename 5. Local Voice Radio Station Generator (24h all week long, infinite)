@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="radioforge"
+ICECAST_PORT="8878"
+CONTROL_PORT="8899"
+
+# ---- Research anchors (for you; not required to run) ----
+# Liquidsoap can output to Icecast via output.icecast + %mp3 encoder.  :contentReference[oaicite:0]{index=0}
+# Icecast source-password is the credential for sources (Liquidsoap connects as user 'source'). :contentReference[oaicite:1]{index=1}
+# Piper is a fast local neural TTS; upstream moved to OHF-Voice/piper1-gpl; voices are published (e.g., HF rhasspy/piper-voices). :contentReference[oaicite:2]{index=2}
+# Icecast + Liquidsoap is a standard free-software internet radio stack. :contentReference[oaicite:3]{index=3}
+
+mkdir -p "$APP_DIR"/{app,liquidsoap,icecast,radio/audio/outbox,radio/voices,radio/state}
+
+# -------------------------
+# README (uses ~~~ so it won't break this outer ``` block)
+# -------------------------
+cat > "$APP_DIR/README.md" <<'MD'
+# RadioForge — Local Voice Radio Station Generator (24/7, infinite)
+
+A self-hosted, always-on, AI-voice radio station:
+- **Generates show segments** (host banter, headlines, fake ads, bumpers)
+- **Synthesizes speech locally** via **Piper TTS**
+- **Streams 24/7** via **Liquidsoap → Icecast**
+- Includes a **Control API** to trigger/inspect generation
+
+No cloud dependency required (except first-time model download of a Piper voice).
+
+---
+
+## What you get (in one docker compose)
+- **Icecast** server: `http://localhost:8878/stream.mp3`
+- **Liquidsoap** automation: continuously streams
+- **RadioForge generator**: creates new voice segments and drops them into the playlist folder
+- **Control API**: `http://localhost:8899`
+
+---
+
+## Quick start
+~~~bash
+cd radioforge
+docker compose up --build
+~~~
+
+Open the stream:
+- `http://localhost:8878/stream.mp3`
+
+Control API:
+- `GET  http://localhost:8899/health`
+- `GET  http://localhost:8899/status`
+- `POST http://localhost:8899/generate` (forces a new segment immediately)
+
+---
+
+## How it works
+1) **Generator** writes MP3 files into `/radio/audio/outbox/`
+2) **Liquidsoap** plays anything in that folder; if empty, it falls back to a continuous **bed** track.
+3) Liquidsoap encodes MP3 and **pushes** it to Icecast mount `/stream.mp3`.
+
+---
+
+## Configuration (env vars in docker-compose.yml)
+- `STATION_NAME` – branding used in scripts
+- `LANG` – `en` or `nl` (script language + voice selection)
+- `VOICE_ID` – Piper voice id (default: `en_US-lessac-medium`)
+- `GEN_INTERVAL_SEC` – how often a new segment is generated
+- `MAX_OUTBOX_FILES` – keep storage bounded
+
+---
+
+## Notes
+- First run will download the Piper voice model into `./radio/voices/` and reuse it.
+- Everything is local. No external APIs are required after the voice model is present.
+MD
+
+# -------------------------
+# docker-compose
+# -------------------------
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  icecast:
+    image: ghcr.io/crazy-max/icecast:latest
+    container_name: radioforge_icecast
+    ports:
+      - "${ICECAST_PORT}:8000"
+    environment:
+      - ICECAST_SOURCE_PASSWORD=sourcepass
+      - ICECAST_ADMIN_PASSWORD=adminpass
+      - ICECAST_RELAY_PASSWORD=relaypass
+      - ICECAST_HOSTNAME=localhost
+    volumes:
+      - ./icecast:/etc/icecast2
+    restart: unless-stopped
+
+  liquidsoap:
+    image: savonet/liquidsoap:latest
+    container_name: radioforge_liquidsoap
+    depends_on:
+      - icecast
+    volumes:
+      - ./liquidsoap:/liquidsoap
+      - ./radio:/radio
+    command: ["liquidsoap", "/liquidsoap/radio.liq"]
+    restart: unless-stopped
+
+  radioforge:
+    build: ./app
+    container_name: radioforge_generator
+    depends_on:
+      - icecast
+    environment:
+      - STATION_NAME=RadioForge FM
+      - LANG=en
+      - VOICE_ID=en_US-lessac-medium
+      - GEN_INTERVAL_SEC=70
+      - MAX_OUTBOX_FILES=120
+      - OUTBOX_DIR=/radio/audio/outbox
+      - VOICES_DIR=/radio/voices
+      - STATE_DIR=/radio/state
+      - ICECAST_MOUNT=/stream.mp3
+    volumes:
+      - ./radio:/radio
+    ports:
+      - "${CONTROL_PORT}:8899"
+    restart: unless-stopped
+EOF
+
+# -------------------------
+# Icecast config (minimal, works with env-file defaults)
+# We keep it simple: the crazy-max/icecast image reads env vars for passwords.
+# -------------------------
+cat > "$APP_DIR/icecast/icecast.xml" <<'XML'
+<icecast>
+  <location>RadioForge</location>
+  <admin>admin@localhost</admin>
+
+  <limits>
+    <clients>100</clients>
+    <sources>5</sources>
+    <queue-size>524288</queue-size>
+    <client-timeout>30</client-timeout>
+    <header-timeout>15</header-timeout>
+    <source-timeout>10</source-timeout>
+    <burst-on-connect>1</burst-on-connect>
+    <burst-size>65535</burst-size>
+  </limits>
+
+  <authentication>
+    <source-password>sourcepass</source-password>
+    <relay-password>relaypass</relay-password>
+    <admin-user>admin</admin-user>
+    <admin-password>adminpass</admin-password>
+  </authentication>
+
+  <hostname>localhost</hostname>
+
+  <listen-socket>
+    <port>8000</port>
+  </listen-socket>
+
+  <fileserve>1</fileserve>
+
+  <paths>
+    <basedir>/usr/share/icecast2</basedir>
+    <logdir>/var/log/icecast2</logdir>
+    <webroot>/usr/share/icecast2/web</webroot>
+    <adminroot>/usr/share/icecast2/admin</adminroot>
+    <alias source="/" dest="/status.xsl"/>
+  </paths>
+
+  <logging>
+    <accesslog>access.log</accesslog>
+    <errorlog>error.log</errorlog>
+    <loglevel>3</loglevel>
+  </logging>
+</icecast>
+XML
+
+# -------------------------
+# Liquidsoap script
+# - Plays MP3 files dropped into /radio/audio/outbox
+# - If none are available, falls back to a bed loop (/radio/audio/bed.mp3)
+# - Pushes to Icecast mount /stream.mp3
+# -------------------------
+cat > "$APP_DIR/liquidsoap/radio.liq" <<'LIQ'
+set("log.stdout", true)
+set("log.level", 3)
+
+station = "RadioForge FM"
+outbox = "/radio/audio/outbox"
+bed    = "/radio/audio/bed.mp3"
+
+# Play generated segments; if empty, fallback to bed loop (continuous)
+segments = playlist(mode="randomize", reload=5.0, outbox)
+bg = single(bed)
+
+radio = fallback(track_sensitive=false, [segments, bg])
+
+# Output to Icecast as MP3
+output.icecast(
+  %mp3(bitrate=192, stereo=true),
+  host="icecast",
+  port=8000,
+  password="sourcepass",
+  mount="/stream.mp3",
+  name=station,
+  description="Local AI voice radio",
+  genre="AI Radio",
+  public=false,
+  radio
+)
+LIQ
+
+# -------------------------
+# Generator app (FastAPI + background loop)
+# - Ensures bed.mp3 exists (procedural synthesis via ffmpeg)
+# - Downloads Piper voice model if missing
+# - Generates scripts (host/news/ad/bumpers) and synthesizes speech with Piper
+# - Mixes speech with subtle bed underlay and exports MP3 to outbox
+# -------------------------
+cat > "$APP_DIR/app/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /srv
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY radioforge ./radioforge
+
+EXPOSE 8899
+CMD ["python", "-m", "radioforge.main"]
+DOCKER
+
+cat > "$APP_DIR/app/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+requests==2.32.3
+
+# Piper TTS (local neural TTS)
+piper-tts==1.2.0
+REQ
+
+mkdir -p "$APP_DIR/app/radioforge"
+
+cat > "$APP_DIR/app/radioforge/__init__.py" <<'PY'
+PY
+
+cat > "$APP_DIR/app/radioforge/util.py" <<'PY'
+import os
+import re
+import time
+import json
+import shutil
+import random
+import string
+import subprocess
+from pathlib import Path
+from datetime import datetime, timezone
+
+def utc_ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+def safe_slug(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s or "segment"
+
+def run(cmd: list[str]) -> None:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}")
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def bounded_outbox(outbox: Path, keep: int) -> None:
+    files = sorted([p for p in outbox.glob("*.mp3") if p.is_file()], key=lambda x: x.stat().st_mtime, reverse=True)
+    for p in files[keep:]:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+def write_state(state_dir: Path, name: str, data: dict) -> None:
+    ensure_dir(state_dir)
+    tmp = state_dir / f".{name}.tmp"
+    final = state_dir / f"{name}.json"
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(final)
+
+def read_state(state_dir: Path, name: str) -> dict | None:
+    p = state_dir / f"{name}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def rand_id(n: int = 6) -> str:
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+PY
+
+cat > "$APP_DIR/app/radioforge/piper_voice.py" <<'PY'
+import os
+import json
+import requests
+from pathlib import Path
+
+# We download from the rhasspy/piper-voices HuggingFace repository (public).
+# Format:
+#   https://huggingface.co/rhasspy/piper-voices/resolve/main/<LANG>/<VOICE>/<QUALITY>/<VOICE>.onnx
+#   https://huggingface.co/rhasspy/piper-voices/resolve/main/<...>/<VOICE>.onnx.json
+
+HF_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+
+def _voice_path_parts(voice_id: str) -> tuple[str, str, str]:
+    # voice_id like: en_US-lessac-medium
+    # We map to HF path convention: en/en_US/lessac/medium/en_US-lessac-medium
+    # This mapping matches common piper-voices structure.
+    # If a voice is missing, the error will be explicit.
+    lang_region, name, quality = voice_id.split("-", 2)
+    lang = lang_region.split("_", 1)[0]
+    return lang, lang_region, name, quality
+
+def ensure_voice(voice_id: str, voices_dir: Path) -> tuple[Path, Path]:
+    voices_dir.mkdir(parents=True, exist_ok=True)
+
+    # Expected filenames
+    model_file = voices_dir / f"{voice_id}.onnx"
+    cfg_file   = voices_dir / f"{voice_id}.onnx.json"
+
+    if model_file.exists() and cfg_file.exists():
+        return model_file, cfg_file
+
+    lang, lang_region, name, quality = _voice_path_parts(voice_id)
+    base = f"{HF_BASE}/{lang}/{lang_region}/{name}/{quality}/{voice_id}"
+
+    model_url = base + ".onnx"
+    cfg_url   = base + ".onnx.json"
+
+    def dl(url: str, dest: Path):
+        r = requests.get(url, stream=True, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to download {url} (status {r.status_code})")
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        with tmp.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+        tmp.replace(dest)
+
+    dl(model_url, model_file)
+    dl(cfg_url, cfg_file)
+
+    return model_file, cfg_file
+PY
+
+cat > "$APP_DIR/app/radioforge/audio.py" <<'PY'
+import math
+import random
+from pathlib import Path
+from .util import run, ensure_dir
+
+def ensure_bed_mp3(path: Path) -> None:
+    """
+    Create a subtle continuous bed track procedurally (no copyrighted music).
+    90 seconds loopable pad made from layered sine waves + gentle noise.
+    """
+    ensure_dir(path.parent)
+    if path.exists() and path.stat().st_size > 10_000:
+        return
+
+    # ffmpeg synth: multiple sine sources mixed
+    # We generate WAV then encode MP3.
+    wav = path.with_suffix(".wav")
+    run([
+        "ffmpeg","-y",
+        "-f","lavfi","-i","sine=frequency=110:duration=90",
+        "-f","lavfi","-i","sine=frequency=220:duration=90",
+        "-f","lavfi","-i","sine=frequency=330:duration=90",
+        "-filter_complex",
+        "amix=inputs=3:normalize=0,volume=0.06,afade=t=in:ss=0:d=1,afade=t=out:st=88:d=2",
+        str(wav)
+    ])
+    run(["ffmpeg","-y","-i",str(wav),"-codec:a","libmp3lame","-b:a","192k",str(path)])
+    try:
+        wav.unlink()
+    except Exception:
+        pass
+
+def mix_voice_over_bed(voice_wav: Path, bed_mp3: Path, out_mp3: Path) -> None:
+    """
+    Mix voice WAV with bed MP3, duck bed under voice.
+    """
+    ensure_dir(out_mp3.parent)
+    run([
+        "ffmpeg","-y",
+        "-i", str(bed_mp3),
+        "-i", str(voice_wav),
+        "-filter_complex",
+        # Bed is quiet; voice is foreground; add limiter
+        "[0:a]volume=0.18[bed];"
+        "[1:a]volume=1.0[vox];"
+        "[bed][vox]amix=inputs=2:normalize=0,alimiter=limit=0.95",
+        "-codec:a","libmp3lame","-b:a","192k",
+        str(out_mp3)
+    ])
+PY
+
+cat > "$APP_DIR/app/radioforge/scriptgen.py" <<'PY'
+import random
+from datetime import datetime
+
+def _headline_pack(lang: str):
+    # Procedurally varied "headlines" (fictional) to keep it infinite without external feeds.
+    # These are intentionally absurd/edgy-but-safe (no hate/targeting).
+    if lang == "nl":
+        return [
+            "Lokale robotstofzuiger eist pauze: 'Ik ben geen Roomba, ik ben een kunstenaar.'",
+            "Nieuw onderzoek: koffie werkt beter als je het beledigt vóór je het drinkt.",
+            "Gemeente introduceert 'stiltebelasting' voor mensen die te rustig zijn in de trein.",
+            "Man bouwt thuis een datacenter om één Excel-sheet sneller te openen.",
+            "Kat benoemd tot interim projectmanager: sprintplanning nu 14 uur slapen."
+        ]
+    return [
+        "Local robot vacuum demands a break: 'I’m not a Roomba, I’m an artist.'",
+        "New study: coffee works better if you insult it before drinking.",
+        "City introduces a 'silence tax' for people who are too quiet on trains.",
+        "Man builds a home datacenter to open one spreadsheet faster.",
+        "Cat appointed interim project manager: sprint planning is now 14 hours of naps."
+    ]
+
+def generate_segment(station: str, lang: str) -> tuple[str, str]:
+    """
+    Returns (segment_type, text). Purely local: no web feeds required.
+    """
+    now = datetime.now().strftime("%H:%M")
+    roll = random.random()
+
+    if lang == "nl":
+        if roll < 0.45:
+            t = random.choice([
+                f"Yo luisteraars, je zit op {station}. Het is {now}. We gaan strak door, geen pauzes, geen excuses.",
+                f"{station} hier. {now}. Als je vandaag iets uitstelt: prima. Maar doe het dan met overtuiging.",
+                f"Welkom terug bij {station}. Het is {now}. Jij brengt de chaos, wij de soundtrack."
+            ])
+            return "host", t
+        if roll < 0.75:
+            h = random.sample(_headline_pack(lang), k=2)
+            t = f"Snelle headlines. Eén: {h[0]} Twee: {h[1]} En nu: terug naar geluid dat je hersenen net niet begrijpen."
+            return "news", t
+        else:
+            t = random.choice([
+                "Deze show wordt gesponsord door 'Deadline Parfum'. Ruikt naar paniek en net iets te laat.",
+                "Advertentieblok: koop nu de nieuwe 'Motivatie'. Werkt niet, maar de verpakking is premium.",
+                "Sponsorbericht: 'Autofill Deluxe'. Vult je formulieren in én je existential dread."
+            ])
+            return "ad", t
+
+    # EN
+    if roll < 0.45:
+        t = random.choice([
+            f"You're listening to {station}. It's {now}. No pauses, no apologies, just signal.",
+            f"{station} here. {now}. If you're procrastinating, at least do it with style.",
+            f"Welcome back to {station}. It's {now}. You bring the chaos — we bring the soundtrack."
+        ])
+        return "host", t
+    if roll < 0.75:
+        h = random.sample(_headline_pack(lang), k=2)
+        t = f"Quick headlines. One: {h[0]} Two: {h[1]} And now: back to audio that almost makes sense."
+        return "news", t
+    t = random.choice([
+        "This show is sponsored by 'Deadline Cologne'. Smells like panic and just barely on time.",
+        "Ad break: buy the new 'Motivation'. It doesn't work, but the packaging is premium.",
+        "Sponsor message: 'Autofill Deluxe'. It fills your forms and your existential dread."
+    ])
+    return "ad", t
+PY
+
+cat > "$APP_DIR/app/radioforge/tts.py" <<'PY'
+from pathlib import Path
+from piper import PiperVoice
+from .piper_voice import ensure_voice
+from .util import ensure_dir
+
+def tts_to_wav(text: str, voice_id: str, voices_dir: Path, out_wav: Path) -> None:
+    ensure_dir(out_wav.parent)
+    model_path, cfg_path = ensure_voice(voice_id, voices_dir)
+
+    voice = PiperVoice.load(str(model_path), str(cfg_path))
+    with out_wav.open("wb") as f:
+        voice.synthesize(text, f)
+PY
+
+cat > "$APP_DIR/app/radioforge/main.py" <<'PY'
+import os
+import time
+import threading
+from pathlib import Path
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from .util import utc_ts, safe_slug, bounded_outbox, write_state, read_state, rand_id
+from .audio import ensure_bed_mp3, mix_voice_over_bed
+from .tts import tts_to_wav
+from .scriptgen import generate_segment
+
+STATION_NAME = os.getenv("STATION_NAME", "RadioForge FM")
+LANG = os.getenv("LANG", "en").strip().lower()
+VOICE_ID = os.getenv("VOICE_ID", "en_US-lessac-medium")
+GEN_INTERVAL_SEC = int(os.getenv("GEN_INTERVAL_SEC", "70"))
+MAX_OUTBOX_FILES = int(os.getenv("MAX_OUTBOX_FILES", "120"))
+
+OUTBOX_DIR = Path(os.getenv("OUTBOX_DIR", "/radio/audio/outbox"))
+VOICES_DIR = Path(os.getenv("VOICES_DIR", "/radio/voices"))
+STATE_DIR = Path(os.getenv("STATE_DIR", "/radio/state"))
+
+BED_MP3 = Path("/radio/audio/bed.mp3")
+
+app = FastAPI(title="RadioForge Control API")
+
+_lock = threading.Lock()
+_last = {"last_segment": None, "last_error": None, "running": True}
+
+class GenReq(BaseModel):
+    kind: str | None = None
+
+def _generate_once(force_kind: str | None = None) -> dict:
+    ensure_bed_mp3(BED_MP3)
+
+    seg_type, text = generate_segment(STATION_NAME, LANG)
+    if force_kind:
+        seg_type = force_kind
+
+    sid = f"{utc_ts()}_{seg_type}_{rand_id()}"
+    wav = Path("/tmp") / f"{sid}.wav"
+    mp3 = OUTBOX_DIR / f"{sid}_{safe_slug(STATION_NAME)}.mp3"
+
+    tts_to_wav(text, VOICE_ID, VOICES_DIR, wav)
+    mix_voice_over_bed(wav, BED_MP3, mp3)
+
+    try:
+        wav.unlink()
+    except Exception:
+        pass
+
+    bounded_outbox(OUTBOX_DIR, MAX_OUTBOX_FILES)
+
+    meta = {
+        "id": sid,
+        "type": seg_type,
+        "station": STATION_NAME,
+        "lang": LANG,
+        "voice_id": VOICE_ID,
+        "text": text,
+        "file": str(mp3),
+        "ts": utc_ts(),
+    }
+    write_state(STATE_DIR, "last", meta)
+    return meta
+
+def _bg_loop():
+    while True:
+        with _lock:
+            if not _last["running"]:
+                time.sleep(0.5)
+                continue
+        try:
+            meta = _generate_once()
+            with _lock:
+                _last["last_segment"] = meta
+                _last["last_error"] = None
+        except Exception as e:
+            with _lock:
+                _last["last_error"] = str(e)
+        time.sleep(GEN_INTERVAL_SEC)
+
+@app.on_event("startup")
+def start():
+    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_bed_mp3(BED_MP3)
+    t = threading.Thread(target=_bg_loop, daemon=True)
+    t.start()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/status")
+def status():
+    last_state = read_state(STATE_DIR, "last")
+    with _lock:
+        return {
+            "station": STATION_NAME,
+            "lang": LANG,
+            "voice_id": VOICE_ID,
+            "interval_sec": GEN_INTERVAL_SEC,
+            "outbox_dir": str(OUTBOX_DIR),
+            "last": last_state or _last["last_segment"],
+            "last_error": _last["last_error"],
+            "running": _last["running"],
+        }
+
+@app.post("/generate")
+def generate(req: GenReq):
+    meta = _generate_once(force_kind=req.kind)
+    with _lock:
+        _last["last_segment"] = meta
+        _last["last_error"] = None
+    return meta
+
+@app.post("/pause")
+def pause():
+    with _lock:
+        _last["running"] = False
+    return {"running": False}
+
+@app.post("/resume")
+def resume():
+    with _lock:
+        _last["running"] = True
+    return {"running": True}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("radioforge.main:app", host="0.0.0.0", port=8899, log_level="info")
+PY
+
+# Entry point module
+cat > "$APP_DIR/app/radioforge/__main__.py" <<'PY'
+from .main import app
+PY
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Listen:"
+echo "  http://localhost:${ICECAST_PORT}/stream.mp3"
+echo
+echo "Control API:"
+echo "  http://localhost:${CONTROL_PORT}/status"
