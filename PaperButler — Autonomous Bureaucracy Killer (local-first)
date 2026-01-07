@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="paperbutler"
+PORT="8833"
+
+mkdir -p "$APP_DIR"/{app,app/static,data}
+
+cat > "$APP_DIR/README.md" <<'MD'
+# PaperButler — Autonomous Bureaucracy Killer (local-first)
+
+## Run
+~~~bash
+docker compose up --build
+~~~
+Open: http://localhost:8833
+
+## What it does
+1) Upload a fillable PDF (AcroForm)
+2) Inspect detected fields
+3) Maintain a profile (JSON)
+4) Create a mapping: PDF field -> profile JSON path OR literal value
+5) Generate filled PDF + audit log
+
+Notes:
+- Some PDFs require `NeedAppearances` for values to display; PaperButler sets it.
+MD
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  paperbutler:
+    build: .
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    ports:
+      - "${PORT}:8000"
+EOF
+
+cat > "$APP_DIR/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+pypdf==6.1.1
+REQ
+
+cat > "$APP_DIR/app/storage.py" <<'PY'
+import json
+import os
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+UPLOADS = DATA_DIR / "uploads"
+OUTPUTS = DATA_DIR / "outputs"
+PROFILE = DATA_DIR / "profile.json"
+MAPPINGS = DATA_DIR / "mappings"
+AUDIT = DATA_DIR / "audit.log.jsonl"
+
+for p in (DATA_DIR, UPLOADS, OUTPUTS, MAPPINGS):
+    p.mkdir(parents=True, exist_ok=True)
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def load_profile() -> Dict[str, Any]:
+    if PROFILE.exists():
+        return json.loads(PROFILE.read_text(encoding="utf-8"))
+    # default empty object (no placeholders beyond empty JSON)
+    PROFILE.write_text("{}", encoding="utf-8")
+    return {}
+
+def save_profile(obj: Dict[str, Any]) -> None:
+    PROFILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def save_mapping(name: str, mapping: Dict[str, Any]) -> Path:
+    path = MAPPINGS / f"{name}.json"
+    path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+def load_mapping(name: str) -> Dict[str, Any]:
+    path = MAPPINGS / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(name)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def list_mappings() -> List[str]:
+    return sorted([p.stem for p in MAPPINGS.glob("*.json")])
+
+def audit(event: Dict[str, Any]) -> None:
+    event = dict(event)
+    event["ts"] = utc_iso()
+    with AUDIT.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+PY
+
+cat > "$APP_DIR/app/jsonpathlite.py" <<'PY'
+from typing import Any, Dict
+
+def get_path(obj: Dict[str, Any], path: str) -> Any:
+    """
+    Minimal JSON-path-like resolver:
+      - dot paths: a.b.c
+      - array index: a.items[0].name
+    """
+    cur: Any = obj
+    p = (path or "").strip()
+    if not p:
+        raise KeyError("empty path")
+    parts = []
+    buf = ""
+    i = 0
+    while i < len(p):
+        ch = p[i]
+        if ch == ".":
+            if buf:
+                parts.append(buf); buf = ""
+            i += 1; continue
+        if ch == "[":
+            if buf:
+                parts.append(buf); buf = ""
+            j = p.find("]", i)
+            if j == -1:
+                raise KeyError("bad index syntax")
+            idx = int(p[i+1:j])
+            parts.append(idx)
+            i = j + 1
+            continue
+        buf += ch
+        i += 1
+    if buf:
+        parts.append(buf)
+
+    for key in parts:
+        if isinstance(key, int):
+            cur = cur[key]
+        else:
+            cur = cur[key]
+    return cur
+PY
+
+cat > "$APP_DIR/app/pdf_forms.py" <<'PY'
+from __future__ import annotations
+from typing import Dict, Any, Tuple
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject, BooleanObject
+
+def set_need_appearances(writer: PdfWriter) -> None:
+    """
+    Many PDFs don't render field values unless NeedAppearances is true.
+    """
+    root = writer._root_object  # pypdf internal
+    if "/AcroForm" not in root:
+        root.update({NameObject("/AcroForm"): writer._add_object({})})
+    acro = root["/AcroForm"]
+    try:
+        acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
+    except Exception:
+        # best-effort; some PDFs may have odd structures
+        pass
+
+def extract_fields(pdf_bytes: bytes) -> Dict[str, Dict[str, Any]]:
+    reader = PdfReader(io_bytes(pdf_bytes))
+    fields = reader.get_fields() or {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in fields.items():
+        # v is a Field object/dict-like
+        out[k] = {
+            "type": str(v.get("/FT", "")),
+            "value": v.get("/V", None),
+            "flags": int(v.get("/Ff", 0) or 0),
+        }
+    return out
+
+def fill_pdf(pdf_bytes: bytes, values: Dict[str, Any]) -> bytes:
+    reader = PdfReader(io_bytes(pdf_bytes))
+    writer = PdfWriter()
+
+    # Copy pages then fill values on each page
+    for page in reader.pages:
+        writer.add_page(page)
+
+    # Try update values across all pages (widgets may appear on multiple pages)
+    for i, page in enumerate(writer.pages):
+        writer.update_page_form_field_values(page, values)
+
+    set_need_appearances(writer)
+
+    out = io_bytes()
+    writer.write(out)
+    return out.getvalue()
+
+def io_bytes(initial: bytes | None = None):
+    import io
+    return io.BytesIO(initial if initial is not None else b"")
+PY
+
+cat > "$APP_DIR/app/main.py" <<'PY'
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from pypdf import PdfReader
+
+from .storage import UPLOADS, OUTPUTS, load_profile, save_profile, save_mapping, load_mapping, list_mappings, audit
+from .jsonpathlite import get_path
+from .pdf_forms import fill_pdf
+
+app = FastAPI(title="PaperButler")
+BASE = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+
+def safe_name(s: str) -> str:
+    s = "".join(ch for ch in (s or "") if ch.isalnum() or ch in ("-","_","."))
+    return s.strip("._-") or "file"
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return (BASE / "static" / "index.html").read_text(encoding="utf-8")
+
+@app.get("/api/profile")
+def api_get_profile():
+    return load_profile()
+
+@app.post("/api/profile")
+async def api_set_profile(body: Dict[str, Any]):
+    save_profile(body)
+    audit({"event":"profile_saved"})
+    return {"ok": True}
+
+@app.get("/api/mappings")
+def api_list_mappings():
+    return {"mappings": list_mappings()}
+
+@app.get("/api/mapping/{name}")
+def api_get_mapping(name: str):
+    try:
+        return load_mapping(name)
+    except FileNotFoundError:
+        raise HTTPException(404, "mapping not found")
+
+@app.post("/api/mapping/{name}")
+async def api_save_mapping(name: str, body: Dict[str, Any]):
+    name = safe_name(name)
+    save_mapping(name, body)
+    audit({"event":"mapping_saved","name":name,"fields":len(body.get("fields",{}))})
+    return {"ok": True, "name": name}
+
+@app.post("/api/upload")
+async def api_upload(pdf: UploadFile = File(...)):
+    if not pdf.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "upload a .pdf")
+    name = safe_name(pdf.filename)
+    raw = await pdf.read()
+    path = UPLOADS / name
+    path.write_bytes(raw)
+
+    # Extract fields via PdfReader.get_fields()
+    reader = PdfReader(path)
+    fields = reader.get_fields() or {}
+    out = []
+    for k, v in fields.items():
+        out.append({
+            "name": k,
+            "ft": str(v.get("/FT","")),
+            "value": v.get("/V", None),
+            "flags": int(v.get("/Ff",0) or 0),
+        })
+
+    audit({"event":"pdf_uploaded","file":name,"field_count":len(out)})
+    return {"file": name, "fields": out}
+
+def resolve_value(spec: Dict[str, Any], profile: Dict[str, Any]) -> Any:
+    """
+    spec formats:
+      {"type":"literal","value":"..."}
+      {"type":"path","path":"person.name"}
+    """
+    t = (spec.get("type") or "").strip()
+    if t == "literal":
+        return spec.get("value", "")
+    if t == "path":
+        return get_path(profile, str(spec.get("path","")))
+    raise ValueError("bad spec")
+
+@app.post("/api/fill")
+async def api_fill(
+    file: str = Form(...),
+    mapping_name: str = Form(...),
+    flatten: bool = Form(False),
+):
+    file = safe_name(file)
+    mapping_name = safe_name(mapping_name)
+
+    pdf_path = UPLOADS / file
+    if not pdf_path.exists():
+        raise HTTPException(404, "pdf not found")
+
+    mapping = load_mapping(mapping_name)
+    fields_map: Dict[str, Dict[str, Any]] = mapping.get("fields", {})
+    profile = load_profile()
+
+    resolved: Dict[str, Any] = {}
+    failures = []
+    for pdf_field, spec in fields_map.items():
+        try:
+            resolved[pdf_field] = resolve_value(spec, profile)
+        except Exception as e:
+            failures.append({"field": pdf_field, "error": str(e)})
+
+    out_bytes = fill_pdf(pdf_path.read_bytes(), resolved)
+
+    out_name = f"{pdf_path.stem}__filled__{mapping_name}.pdf"
+    out_path = OUTPUTS / out_name
+    out_path.write_bytes(out_bytes)
+
+    audit({
+        "event":"pdf_filled",
+        "input": file,
+        "output": out_name,
+        "mapping": mapping_name,
+        "filled_fields": len(resolved),
+        "failures": failures,
+    })
+
+    return {"output": out_name, "filled_fields": len(resolved), "failures": failures}
+
+@app.get("/api/download/{name}")
+def api_download(name: str):
+    name = safe_name(name)
+    p = OUTPUTS / name
+    if not p.exists():
+        raise HTTPException(404, "not found")
+    return FileResponse(str(p), filename=p.name, media_type="application/pdf")
+PY
+
+cat > "$APP_DIR/app/static/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>PaperButler</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1100px}
+    input,select,button,textarea{font-size:14px;padding:10px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:14px;margin:14px 0}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .muted{color:#666}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:8px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h1>PaperButler</h1>
+  <p class="muted">Upload fillable PDFs → map fields → auto-fill from profile JSON → export filled PDF + audit trail.</p>
+
+  <div class="card">
+    <h3>1) Upload PDF (AcroForm)</h3>
+    <input id="pdf" type="file" accept="application/pdf"/>
+    <button onclick="upload()">Upload</button>
+    <div id="uout" class="muted"></div>
+    <pre id="fields"></pre>
+  </div>
+
+  <div class="card">
+    <h3>2) Profile JSON</h3>
+    <div class="muted">This is your reusable data source. Save once, reuse across PDFs.</div>
+    <textarea id="profile" style="width:100%;height:220px"></textarea>
+    <button onclick="saveProfile()">Save profile</button>
+    <div id="pout" class="muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>3) Mapping</h3>
+    <div class="muted">
+      Mapping format:
+      <pre>{
+  "fields": {
+    "PDF_FIELD_NAME": {"type":"path","path":"person.name"},
+    "OtherField": {"type":"literal","value":"hello"}
+  }
+}</pre>
+    </div>
+    <div class="row">
+      <input id="mname" placeholder="mapping name (e.g. taxform_2026)" style="flex:1;min-width:260px"/>
+      <button onclick="loadMappingList()">Refresh mapping list</button>
+      <select id="mlist" onchange="loadMapping()"></select>
+    </div>
+    <textarea id="mapping" style="width:100%;height:240px"></textarea>
+    <button onclick="saveMapping()">Save mapping</button>
+    <div id="mout" class="muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>4) Fill PDF</h3>
+    <div class="row">
+      <input id="fname" placeholder="uploaded pdf filename (e.g. form.pdf)" style="flex:1;min-width:260px"/>
+      <input id="usem" placeholder="mapping name" style="flex:1;min-width:260px"/>
+      <button onclick="fill()">Fill</button>
+    </div>
+    <div id="fout" class="muted"></div>
+    <pre id="ffail"></pre>
+  </div>
+
+<script>
+async function upload(){
+  const f = document.getElementById('pdf').files[0];
+  const out = document.getElementById('uout');
+  if(!f){ out.textContent = "Pick a PDF first."; return; }
+  out.textContent = "Uploading…";
+  const fd = new FormData();
+  fd.append("pdf", f);
+  const r = await fetch("/api/upload", {method:"POST", body: fd});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok){ out.textContent = "Error: " + (j.detail||r.status); return; }
+  out.textContent = "OK uploaded: " + j.file + " (fields: " + j.fields.length + ")";
+  document.getElementById('fname').value = j.file;
+  document.getElementById('fields').textContent = JSON.stringify(j.fields, null, 2);
+
+  // bootstrap mapping skeleton
+  const skel = {fields:{}};
+  for(const it of j.fields){
+    // default: literal empty; user edits to path/literal
+    skel.fields[it.name] = {type:"literal", value:""};
+  }
+  document.getElementById('mapping').value = JSON.stringify(skel, null, 2);
+}
+
+async function loadProfile(){
+  const r = await fetch("/api/profile");
+  const j = await r.json();
+  document.getElementById('profile').value = JSON.stringify(j, null, 2);
+}
+async function saveProfile(){
+  const out = document.getElementById('pout');
+  out.textContent = "Saving…";
+  let obj;
+  try{ obj = JSON.parse(document.getElementById('profile').value); }
+  catch(e){ out.textContent = "Invalid JSON"; return; }
+  const r = await fetch("/api/profile", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(obj)});
+  const j = await r.json().catch(()=>({}));
+  out.textContent = r.ok ? "OK saved." : ("Error: " + (j.detail||r.status));
+}
+
+async function loadMappingList(){
+  const sel = document.getElementById('mlist');
+  sel.innerHTML = "";
+  const r = await fetch("/api/mappings");
+  const j = await r.json().catch(()=>({}));
+  const ms = j.mappings || [];
+  for(const m of ms){
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    sel.appendChild(o);
+  }
+}
+
+async function loadMapping(){
+  const name = document.getElementById('mlist').value;
+  if(!name) return;
+  document.getElementById('usem').value = name;
+  const r = await fetch("/api/mapping/" + encodeURIComponent(name));
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) return;
+  document.getElementById('mapping').value = JSON.stringify(j, null, 2);
+}
+
+async function saveMapping(){
+  const out = document.getElementById('mout');
+  const name = (document.getElementById('mname').value || "").trim();
+  if(!name){ out.textContent = "Enter mapping name"; return; }
+  out.textContent = "Saving…";
+  let obj;
+  try{ obj = JSON.parse(document.getElementById('mapping').value); }
+  catch(e){ out.textContent = "Invalid mapping JSON"; return; }
+  const r = await fetch("/api/mapping/" + encodeURIComponent(name), {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(obj)});
+  const j = await r.json().catch(()=>({}));
+  out.textContent = r.ok ? ("OK saved: " + j.name) : ("Error: " + (j.detail||r.status));
+  await loadMappingList();
+}
+
+async function fill(){
+  const fout = document.getElementById('fout');
+  const ffail = document.getElementById('ffail');
+  ffail.textContent = "";
+  fout.textContent = "Filling…";
+
+  const file = (document.getElementById('fname').value||"").trim();
+  const mapping = (document.getElementById('usem').value||"").trim();
+  if(!file || !mapping){ fout.textContent = "Need filename + mapping name"; return; }
+
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("mapping_name", mapping);
+
+  const r = await fetch("/api/fill", {method:"POST", body: fd});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok){ fout.textContent = "Error: " + (j.detail||r.status); return; }
+
+  fout.innerHTML = `OK: <b>${j.output}</b> — <a href="/api/download/${encodeURIComponent(j.output)}">download</a> (fields: ${j.filled_fields})`;
+  if(j.failures && j.failures.length){
+    ffail.textContent = JSON.stringify(j.failures, null, 2);
+  }
+}
+
+loadProfile();
+loadMappingList();
+</script>
+</body>
+</html>
+HTML
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Open:"
+echo "  http://localhost:${PORT}"
