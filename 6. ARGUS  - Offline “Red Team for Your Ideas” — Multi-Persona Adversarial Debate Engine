@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="argus"
+PORT="8933"
+
+mkdir -p "$APP_DIR"/{app/argus,app/argus/templates,app/argus/static,data}
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  argus:
+    build: ./app
+    environment:
+      - ARGUS_DB=/data/argus.sqlite3
+      - ARGUS_STATE=/data
+      - ARGUS_PORT=8000
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=gemma3:4b
+      - ARGUS_MAX_PERSONAS=12
+      - ARGUS_ROUNDS=3
+      - ARGUS_STREAM=false
+    volumes:
+      - ./data:/data
+    ports:
+      - "${PORT}:8000"
+EOF
+
+cat > "$APP_DIR/app/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /srv
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY argus ./argus
+
+EXPOSE 8000
+CMD ["uvicorn", "argus.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/app/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+jinja2==3.1.5
+httpx==0.27.2
+REQ
+
+cat > "$APP_DIR/app/argus/__init__.py" <<'PY'
+PY
+
+cat > "$APP_DIR/app/argus/db.py" <<'PY'
+import os
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(os.getenv("ARGUS_DB", "/data/argus.sqlite3")).resolve()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+def init_db() -> None:
+    with connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              title TEXT NOT NULL,
+              input_text TEXT NOT NULL,
+              status TEXT NOT NULL,
+              error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id, kind);
+            """
+        )
+PY
+
+cat > "$APP_DIR/app/argus/util.py" <<'PY'
+import json
+import time
+import uuid
+from datetime import datetime, timezone
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def new_id() -> str:
+    return uuid.uuid4().hex
+
+def jdump(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+def jloads(s: str):
+    return json.loads(s)
+PY
+
+cat > "$APP_DIR/app/argus/ollama.py" <<'PY'
+import os
+import httpx
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+ARGUS_STREAM = os.getenv("ARGUS_STREAM", "false").lower() in ("1","true","yes","y")
+
+async def chat(messages, *, format_schema=None, temperature=0.2):
+    """
+    Ollama /api/chat:
+      { "model": "...", "messages": [...], "stream": false }
+    Optionally supports structured outputs with "format".
+    """
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False if not ARGUS_STREAM else True,
+        "options": {"temperature": temperature},
+    }
+    if format_schema is not None:
+        payload["format"] = format_schema
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        r = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        # Ollama returns: { message: { role, content }, ... }
+        return data["message"]["content"]
+PY
+
+cat > "$APP_DIR/app/argus/personas.py" <<'PY'
+PERSONAS = [
+  {
+    "id": "investor",
+    "name": "Investeerder",
+    "goal": "ROI, schaalbaarheid, defensibility, moat, risico vs upside.",
+    "rubric": ["market_size","unit_economics","moat","scalability","execution_risk"]
+  },
+  {
+    "id": "user",
+    "name": "Gebruiker",
+    "goal": "Waarde, frictie, adoption, UX, churn-risico.",
+    "rubric": ["value_prop","onboarding","friction","retention","trust"]
+  },
+  {
+    "id": "engineer",
+    "name": "Engineer",
+    "goal": "Haalbaarheid, scope, performance, implementatiecomplexiteit.",
+    "rubric": ["feasibility","complexity","reliability","maintainability","cost"]
+  },
+  {
+    "id": "architect",
+    "name": "Architect",
+    "goal": "Systeemgrenzen, coupling, failure-modes, evolutiepad.",
+    "rubric": ["architecture","coupling","scalability","resilience","operability"]
+  },
+  {
+    "id": "security",
+    "name": "Security Expert",
+    "goal": "Misbruik, aanvalsvlak, threat model, abuse cases.",
+    "rubric": ["authz_authn","data_exposure","abuse","supply_chain","logging"]
+  },
+  {
+    "id": "privacy",
+    "name": "Privacy/GDPR",
+    "goal": "Dataminimalisatie, lawful basis, retention, DPIA-risico’s.",
+    "rubric": ["lawful_basis","data_minimization","retention","rights","third_parties"]
+  },
+  {
+    "id": "legal",
+    "name": "Jurist",
+    "goal": "Aansprakelijkheid, contracten, claims, compliance, IP.",
+    "rubric": ["liability","terms","ip","regulatory","consumer_protection"]
+  },
+  {
+    "id": "regulator",
+    "name": "Regulator/Toezichthouder",
+    "goal": "Normen, auditability, transparency, reporting, enforcement.",
+    "rubric": ["auditability","transparency","controls","reporting","enforcement_risk"]
+  },
+  {
+    "id": "competitor",
+    "name": "Concurrent",
+    "goal": "Hoe kopieer/ondermijn ik dit? Waar is het zwak?",
+    "rubric": ["commoditization","switching_cost","pricing","distribution","differentiation"]
+  },
+  {
+    "id": "marketing",
+    "name": "Marketeer",
+    "goal": "Positionering, messaging, segmentatie, acquisition-kanalen.",
+    "rubric": ["positioning","audience","channels","messaging","brand_risk"]
+  },
+  {
+    "id": "cfo",
+    "name": "CFO/Finance",
+    "goal": "Kosten, cashflow, burn, marge, risico’s.",
+    "rubric": ["costs","cashflow","margin","pricing","financial_risk"]
+  },
+  {
+    "id": "skeptic",
+    "name": "Scepticus",
+    "goal": "Alles slopen: inconsistenties, vage claims, wishful thinking.",
+    "rubric": ["assumptions","evidence","clarity","scope_creep","failure_modes"]
+  },
+]
+PY
+
+cat > "$APP_DIR/app/argus/prompts.py" <<'PY'
+def system_base():
+    return {
+        "role": "system",
+        "content": (
+            "You are ARGUS, a rigorous offline red-team engine. "
+            "Be blunt, specific, and actionable. No fluff. "
+            "Never invent facts about the user's situation; only reason from provided text. "
+            "If something is unknown, mark it as an assumption and ask it as a question."
+        ),
+    }
+
+def extract_claims_prompt(text: str):
+    return [
+        system_base(),
+        {
+            "role": "user",
+            "content": (
+                "Extract a structured claim graph from the plan below.\n\n"
+                "Return JSON with keys:\n"
+                "  goals: [string]\n"
+                "  claims: [{id, claim, evidence_needed, assumptions:[string], dependencies:[string]}]\n"
+                "  risks: [string]\n"
+                "  unknowns: [string]\n\n"
+                "Plan:\n"
+                f"{text}\n"
+            )
+        },
+    ]
+
+def persona_attack_prompt(persona_name: str, persona_goal: str, rubric: list[str], plan: str, claims_json: str):
+    return [
+        system_base(),
+        {
+            "role": "user",
+            "content": (
+                f"You are acting as: {persona_name}.\n"
+                f"Your goal: {persona_goal}\n"
+                f"Rubric dimensions: {', '.join(rubric)}\n\n"
+                "Given the plan and extracted claims, produce a red-team critique.\n"
+                "Return JSON:\n"
+                "  persona: string\n"
+                "  overall_risk_score_0_10: number\n"
+                "  confidence_0_10: number\n"
+                "  key_failures: [{severity:1-5, title, detail, impacted_claim_ids:[string], fix}]\n"
+                "  questions: [string]\n"
+                "  quick_wins: [string]\n\n"
+                "Plan:\n"
+                f"{plan}\n\n"
+                "Claims JSON:\n"
+                f"{claims_json}\n"
+            )
+        },
+    ]
+
+def crossfire_prompt(plan: str, critiques_json: str):
+    return [
+        system_base(),
+        {
+            "role": "user",
+            "content": (
+                "You are orchestrating a crossfire debate between the personas.\n"
+                "Given the critiques JSON, identify conflicts, trade-offs, and contradictions.\n"
+                "Return JSON:\n"
+                "  conflicts: [{between:[string,string], topic, why_conflict, options:[{option, pros, cons, who_prefers:[string]}]}]\n"
+                "  consensus: [{topic, agreed_action, rationale, who_agrees:[string]}]\n"
+                "  unresolved: [string]\n\n"
+                "Plan:\n"
+                f"{plan}\n\n"
+                "Critiques JSON:\n"
+                f"{critiques_json}\n"
+            )
+        },
+    ]
+
+def synthesis_prompt(plan: str, claims_json: str, critiques_json: str, crossfire_json: str):
+    return [
+        system_base(),
+        {
+            "role": "user",
+            "content": (
+                "Synthesize the best possible final red-team report.\n"
+                "Return JSON:\n"
+                "  top_10_problems: [{rank, title, why, evidence_needed, fix}]\n"
+                "  show_stoppers_top_5: [{rank, title, why, fix}]\n"
+                "  easy_fixes_top_5: [{rank, title, fix}]\n"
+                "  assumptions_to_confirm: [string]\n"
+                "  improved_plan: string\n"
+                "  residual_risks: [{risk, why_it_remains, mitigation}]\n\n"
+                "Plan:\n"
+                f"{plan}\n\n"
+                "Claims JSON:\n"
+                f"{claims_json}\n\n"
+                "Critiques JSON:\n"
+                f"{critiques_json}\n\n"
+                "Crossfire JSON:\n"
+                f"{crossfire_json}\n"
+            )
+        },
+    ]
+PY
+
+cat > "$APP_DIR/app/argus/engine.py" <<'PY'
+import os
+import json
+from . import ollama
+from .personas import PERSONAS
+from .util import jdump, jloads
+
+ARGUS_MAX_PERSONAS = int(os.getenv("ARGUS_MAX_PERSONAS", "12"))
+ARGUS_ROUNDS = int(os.getenv("ARGUS_ROUNDS", "3"))
+
+def _json_schema_any_object():
+    # Ollama structured outputs supports JSON schema-like object in "format".
+    # We keep permissive to avoid schema mismatch across models.
+    return {"type":"object"}
+
+async def extract_claims(plan_text: str) -> dict:
+    from .prompts import extract_claims_prompt
+    out = await ollama.chat(extract_claims_prompt(plan_text), format_schema=_json_schema_any_object(), temperature=0.1)
+    return jloads(out)
+
+async def persona_attack(plan_text: str, claims: dict, persona: dict) -> dict:
+    from .prompts import persona_attack_prompt
+    out = await ollama.chat(
+        persona_attack_prompt(persona["name"], persona["goal"], persona["rubric"], plan_text, jdump(claims)),
+        format_schema=_json_schema_any_object(),
+        temperature=0.2,
+    )
+    j = jloads(out)
+    j["persona_id"] = persona["id"]
+    return j
+
+async def crossfire(plan_text: str, critiques: list[dict]) -> dict:
+    from .prompts import crossfire_prompt
+    out = await ollama.chat(
+        crossfire_prompt(plan_text, jdump(critiques)),
+        format_schema=_json_schema_any_object(),
+        temperature=0.2,
+    )
+    return jloads(out)
+
+async def synthesize(plan_text: str, claims: dict, critiques: list[dict], cross: dict) -> dict:
+    from .prompts import synthesis_prompt
+    out = await ollama.chat(
+        synthesis_prompt(plan_text, jdump(claims), jdump(critiques), jdump(cross)),
+        format_schema=_json_schema_any_object(),
+        temperature=0.15,
+    )
+    return jloads(out)
+
+async def run_session(plan_text: str) -> dict:
+    claims = await extract_claims(plan_text)
+
+    personas = PERSONAS[:ARGUS_MAX_PERSONAS]
+    critiques = []
+    for p in personas:
+        critiques.append(await persona_attack(plan_text, claims, p))
+
+    cross = await crossfire(plan_text, critiques)
+
+    final = await synthesize(plan_text, claims, critiques, cross)
+
+    return {
+        "claims": claims,
+        "critiques": critiques,
+        "crossfire": cross,
+        "report": final,
+    }
+PY
+
+cat > "$APP_DIR/app/argus/web.py" <<'PY'
+import os
+from pathlib import Path
+from fastapi import APIRouter, Request, Form, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+
+from .db import connect
+from .util import now_iso, new_id, jdump, jloads
+from .engine import run_session
+
+router = APIRouter()
+
+BASE = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE / "templates"))
+
+def _create_session(title: str, text: str) -> str:
+    sid = new_id()
+    with connect() as c:
+        c.execute(
+            "INSERT INTO sessions(id, created_at, title, input_text, status) VALUES (?,?,?,?,?)",
+            (sid, now_iso(), title, text, "queued"),
+        )
+    return sid
+
+def _save_artifact(session_id: str, kind: str, payload: dict):
+    with connect() as c:
+        c.execute(
+            "INSERT INTO artifacts(session_id, kind, payload_json, created_at) VALUES (?,?,?,?)",
+            (session_id, kind, jdump(payload), now_iso()),
+        )
+
+def _set_status(session_id: str, status: str, error: str | None = None):
+    with connect() as c:
+        c.execute(
+            "UPDATE sessions SET status=?, error=? WHERE id=?",
+            (status, error, session_id),
+        )
+
+async def _do_run(session_id: str):
+    with connect() as c:
+        row = c.execute("SELECT input_text FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        return
+    plan = row["input_text"]
+    try:
+        _set_status(session_id, "running", None)
+        res = await run_session(plan)
+        _save_artifact(session_id, "claims", res["claims"])
+        _save_artifact(session_id, "critiques", {"items": res["critiques"]})
+        _save_artifact(session_id, "crossfire", res["crossfire"])
+        _save_artifact(session_id, "report", res["report"])
+        _set_status(session_id, "done", None)
+    except Exception as e:
+        _set_status(session_id, "error", str(e))
+
+@router.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@router.post("/api/sessions")
+def create_session(bg: BackgroundTasks, title: str = Form(...), text: str = Form(...)):
+    title = (title or "").strip() or "ARGUS Session"
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(400, "text required")
+    sid = _create_session(title, text)
+    bg.add_task(_do_run, sid)
+    return {"id": sid, "status": "queued"}
+
+@router.get("/api/sessions")
+def list_sessions(limit: int = 50):
+    with connect() as c:
+        rows = c.execute(
+            "SELECT id, created_at, title, status, error FROM sessions ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return {"sessions": [dict(r) for r in rows]}
+
+@router.get("/api/sessions/{session_id}")
+def get_session(session_id: str):
+    with connect() as c:
+        s = c.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not s:
+            raise HTTPException(404, "not found")
+        arts = c.execute(
+            "SELECT kind, payload_json, created_at FROM artifacts WHERE session_id=? ORDER BY id ASC",
+            (session_id,),
+        ).fetchall()
+    return {
+        "session": dict(s),
+        "artifacts": [{"kind": a["kind"], "created_at": a["created_at"], "payload": jloads(a["payload_json"])} for a in arts],
+    }
+PY
+
+cat > "$APP_DIR/app/argus/main.py" <<'PY'
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from .db import init_db
+from .web import router
+from pathlib import Path
+
+init_db()
+
+app = FastAPI(title="ARGUS")
+app.include_router(router)
+
+BASE = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+PY
+
+cat > "$APP_DIR/app/argus/templates/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>ARGUS</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    input,textarea,button{font-size:14px;padding:10px}
+    textarea{width:100%;min-height:220px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;margin-top:14px}
+    .muted{color:#666}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:10px}
+    .btn{cursor:pointer}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    @media (max-width: 980px){.grid{grid-template-columns:1fr}}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <h1>ARGUS</h1>
+  <p class="muted">Offline “Red Team for Your Ideas” — multi-persona debate engine (Ollama backend).</p>
+
+  <div class="card">
+    <h3>1) New session</h3>
+    <div class="row">
+      <input id="title" style="flex:1;min-width:280px" placeholder="Title"/>
+      <button class="btn" onclick="start()">Start red-team</button>
+      <span id="st" class="muted"></span>
+    </div>
+    <div style="margin-top:10px">
+      <textarea id="text" placeholder="Paste your plan / pitch / strategy here..."></textarea>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>2) Sessions</h3>
+      <button class="btn" onclick="loadSessions()">Refresh</button>
+      <pre id="sessions"></pre>
+    </div>
+
+    <div class="card">
+      <h3>3) Result</h3>
+      <div class="row">
+        <input id="sid" style="flex:1;min-width:280px" placeholder="Session ID"/>
+        <button class="btn" onclick="loadOne()">Load</button>
+      </div>
+      <pre id="result"></pre>
+    </div>
+  </div>
+
+<script>
+async function start(){
+  const title = document.getElementById('title').value.trim() || 'ARGUS Session';
+  const text  = document.getElementById('text').value.trim();
+  const st = document.getElementById('st');
+  st.textContent = 'Submitting...';
+  const fd = new FormData();
+  fd.set('title', title);
+  fd.set('text', text);
+
+  const r = await fetch('/api/sessions', {method:'POST', body: fd});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok){
+    st.textContent = 'Error: ' + (j.detail || r.status);
+    return;
+  }
+  st.textContent = 'Queued: ' + j.id + ' (poll Load)';
+  document.getElementById('sid').value = j.id;
+  await loadSessions();
+}
+
+async function loadSessions(){
+  const r = await fetch('/api/sessions?limit=30');
+  const j = await r.json();
+  document.getElementById('sessions').textContent = JSON.stringify(j, null, 2);
+}
+
+async function loadOne(){
+  const sid = document.getElementById('sid').value.trim();
+  if(!sid) return;
+  const r = await fetch('/api/sessions/' + encodeURIComponent(sid));
+  const j = await r.json().catch(()=>({}));
+  document.getElementById('result').textContent = JSON.stringify(j, null, 2);
+}
+
+loadSessions();
+</script>
+</body>
+</html>
+HTML
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Open UI:"
+echo "  http://localhost:${PORT}"
+echo
+echo "NOTE:"
+echo "  Set OLLAMA_URL and OLLAMA_MODEL in docker-compose.yml if needed."
