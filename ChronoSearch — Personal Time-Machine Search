@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="chronosearch"
+PORT="8822"
+
+mkdir -p "$APP_DIR"/{app,app/static,data}
+
+# README (uses ~~~ so it won't break this outer ``` block)
+cat > "$APP_DIR/README.md" <<'MD'
+# ChronoSearch — Personal Time-Machine Search (local-first)
+
+## Run (Docker)
+~~~bash
+docker compose up --build
+~~~
+
+Open:
+- http://localhost:8822
+
+## Index (UI)
+- Root path (inside container): `/data`
+- Click **Index**
+
+## Index (CLI)
+~~~bash
+docker compose exec chronosearch python -m app.cli index --root /data
+~~~
+
+## Search (API)
+- Full-text (FTS): `GET /api/search?q=...&mode=fts`
+- Semantic: `GET /api/search?q=...&mode=semantic`
+- Time range: add `&from=YYYY-MM-DD&to=YYYY-MM-DD`
+
+## Diff
+`GET /api/diff?path=relative/path.txt&from_ts=...&to_ts=...`
+MD
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  chronosearch:
+    build: .
+    environment:
+      DATA_DIR: /data
+      CHRONO_DB: /data/chronosearch.sqlite3
+      EMBED_MODEL: sentence-transformers/all-MiniLM-L6-v2
+    volumes:
+      - ./data:/data
+    ports:
+      - "${PORT}:8000"
+EOF
+
+cat > "$APP_DIR/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+httpx==0.27.2
+sentence-transformers==3.3.1
+numpy==2.1.3
+REQ
+
+cat > "$APP_DIR/app/db.py" <<'PY'
+import os
+import sqlite3
+from pathlib import Path
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+DB_PATH = Path(os.getenv("CHRONO_DB", str(DATA_DIR / "chronosearch.sqlite3"))).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+def init_db() -> None:
+    with connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              root TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS files (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              snapshot_id INTEGER NOT NULL,
+              relpath TEXT NOT NULL,
+              abspath TEXT NOT NULL,
+              mtime REAL NOT NULL,
+              size INTEGER NOT NULL,
+              sha256 TEXT NOT NULL,
+              FOREIGN KEY(snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS chunks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              file_id INTEGER NOT NULL,
+              chunk_index INTEGER NOT NULL,
+              start_char INTEGER NOT NULL,
+              end_char INTEGER NOT NULL,
+              text TEXT NOT NULL,
+              text_sha256 TEXT NOT NULL,
+              emb_dim INTEGER NOT NULL,
+              emb BLOB NOT NULL,
+              FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+            );
+
+            -- FTS5 index for fast keyword search
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+              relpath,
+              text,
+              content=''
+            );
+
+            CREATE TABLE IF NOT EXISTS chunks_fts_map (
+              chunk_id INTEGER PRIMARY KEY,
+              fts_rowid INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_files_snapshot_relpath ON files(snapshot_id, relpath);
+            CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+            """
+        )
+PY
+
+cat > "$APP_DIR/app/textutil.py" <<'PY'
+import re
+import hashlib
+from pathlib import Path
+
+TEXT_EXT = {
+    ".md",".txt",".py",".js",".ts",".tsx",".json",".yaml",".yml",".toml",".ini",".cfg",
+    ".log",".csv",".sql",".html",".css",".sh",".ps1",".go",".rs",".java",".c",".cpp",".h"
+}
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def is_probably_text(path: Path, max_probe: int = 4096) -> bool:
+    if path.suffix.lower() in TEXT_EXT:
+        return True
+    try:
+        b = path.read_bytes()[:max_probe]
+    except Exception:
+        return False
+    if not b:
+        return True
+    if b.count(b"\x00") > 0:
+        return False
+    printable = sum(1 for x in b if 9 <= x <= 13 or 32 <= x <= 126)
+    return (printable / len(b)) > 0.85
+
+def normalize_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+def chunk_text(s: str, target_chars: int = 1200, overlap: int = 150):
+    s = s.strip()
+    if not s:
+        return []
+    chunks = []
+    i = 0
+    n = len(s)
+    while i < n:
+        j = min(n, i + target_chars)
+        chunk = s[i:j]
+        chunks.append((i, j, chunk))
+        if j == n:
+            break
+        i = max(0, j - overlap)
+    return chunks
+PY
+
+cat > "$APP_DIR/app/embeddings.py" <<'PY'
+import os
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+_MODEL = None
+
+def get_model() -> SentenceTransformer:
+    global _MODEL
+    if _MODEL is None:
+        name = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        _MODEL = SentenceTransformer(name)
+    return _MODEL
+
+def embed_texts(texts):
+    model = get_model()
+    emb = model.encode(
+        texts,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    return emb.astype(np.float32)
+
+def pack_vec(v: np.ndarray) -> bytes:
+    return v.astype(np.float32).tobytes()
+
+def unpack_vec(b: bytes, dim: int) -> np.ndarray:
+    return np.frombuffer(b, dtype=np.float32, count=dim)
+PY
+
+cat > "$APP_DIR/app/indexer.py" <<'PY'
+import time
+from pathlib import Path
+from datetime import datetime, timezone
+
+import numpy as np
+
+from .db import connect
+from .textutil import is_probably_text, sha256_bytes, sha256_text, normalize_whitespace, chunk_text
+from .embeddings import embed_texts, pack_vec
+
+def utc_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def iter_files(root: Path):
+    for p in root.rglob("*"):
+        if p.is_dir():
+            continue
+        try:
+            st = p.stat()
+        except Exception:
+            continue
+        if st.st_size > 50 * 1024 * 1024:
+            continue
+        yield p
+
+def fts_upsert(conn, chunk_id: int, relpath: str, text: str):
+    row = conn.execute(
+        "SELECT fts_rowid FROM chunks_fts_map WHERE chunk_id=?",
+        (chunk_id,),
+    ).fetchone()
+    if row:
+        conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (row["fts_rowid"],))
+        conn.execute("DELETE FROM chunks_fts_map WHERE chunk_id=?", (chunk_id,))
+    cur = conn.execute(
+        "INSERT INTO chunks_fts(relpath, text) VALUES (?,?)",
+        (relpath, text),
+    )
+    fts_rowid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO chunks_fts_map(chunk_id, fts_rowid) VALUES (?,?)",
+        (chunk_id, fts_rowid),
+    )
+
+def create_snapshot(root: str) -> int:
+    rootp = Path(root).resolve()
+    if not rootp.exists() or not rootp.is_dir():
+        raise ValueError("root must be an existing directory")
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO snapshots(root, created_at) VALUES (?, ?)",
+            (str(rootp), utc_iso()),
+        )
+        return int(cur.lastrowid)
+
+def index_snapshot(snapshot_id: int) -> dict:
+    with connect() as conn:
+        snap = conn.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
+    if not snap:
+        raise ValueError("snapshot not found")
+
+    root = Path(snap["root"]).resolve()
+
+    t0 = time.time()
+    files_indexed = 0
+    chunks_indexed = 0
+
+    for p in iter_files(root):
+        rel = str(p.relative_to(root))
+        try:
+            st = p.stat()
+            raw = p.read_bytes()
+        except Exception:
+            continue
+
+        raw_sha = sha256_bytes(raw)
+
+        # store file record
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO files(snapshot_id, relpath, abspath, mtime, size, sha256)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (snapshot_id, rel, str(p), st.st_mtime, st.st_size, raw_sha),
+            )
+            file_id = int(cur.lastrowid)
+
+        if not is_probably_text(p):
+            files_indexed += 1
+            continue
+
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except Exception:
+            files_indexed += 1
+            continue
+
+        text = normalize_whitespace(text)
+
+        chunks = chunk_text(text)
+        if not chunks:
+            files_indexed += 1
+            continue
+
+        texts = [c[2] for c in chunks]
+        embs = embed_texts(texts)
+
+        with connect() as conn:
+            for idx, ((a, b, chunk), vec) in enumerate(zip(chunks, embs)):
+                tsha = sha256_text(chunk)
+                dim = int(vec.shape[0])
+                cur = conn.execute(
+                    """
+                    INSERT INTO chunks(file_id, chunk_index, start_char, end_char, text, text_sha256, emb_dim, emb)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (file_id, idx, a, b, chunk, tsha, dim, pack_vec(vec)),
+                )
+                chunk_id = int(cur.lastrowid)
+                fts_upsert(conn, chunk_id, rel, chunk)
+                chunks_indexed += 1
+
+        files_indexed += 1
+
+    return {
+        "snapshot_id": snapshot_id,
+        "files_indexed": files_indexed,
+        "chunks_indexed": chunks_indexed,
+        "seconds": round(time.time() - t0, 3),
+    }
+
+def create_and_index(root: str) -> dict:
+    sid = create_snapshot(root)
+    return index_snapshot(sid)
+PY
+
+cat > "$APP_DIR/app/api.py" <<'PY'
+import difflib
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from pydantic import BaseModel, Field
+
+from .db import connect
+from .indexer import create_and_index
+from .embeddings import embed_texts, unpack_vec
+
+router = APIRouter()
+
+def parse_date(d: str):
+    try:
+        if len(d) == 10:
+            return datetime.fromisoformat(d + "T00:00:00")
+        return datetime.fromisoformat(d)
+    except Exception:
+        return None
+
+class IndexReq(BaseModel):
+    root: str = Field(..., min_length=1)
+
+@router.post("/index")
+def index(req: IndexReq, bg: BackgroundTasks):
+    root = req.root.strip()
+
+    def _do():
+        create_and_index(root)
+
+    bg.add_task(_do)
+    return {"status": "queued", "root": root}
+
+@router.get("/snapshots")
+def list_snapshots(limit: int = 50):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, root, created_at FROM snapshots ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return {"snapshots": [dict(r) for r in rows]}
+
+@router.get("/search")
+def search(
+    q: str,
+    mode: str = "semantic",
+    snapshot_id: int | None = None,
+    from_: str | None = None,
+    to: str | None = None,
+    limit: int = 20,
+):
+    q = (q or "").strip()
+    if not q:
+        return {"results": []}
+
+    with connect() as conn:
+        if snapshot_id is None:
+            snap = conn.execute("SELECT id FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+            if not snap:
+                return {"results": []}
+            snapshot_id = int(snap["id"])
+
+        if from_ or to:
+            from_dt = parse_date(from_) if from_ else None
+            to_dt = parse_date(to) if to else None
+            qsql = "SELECT id, created_at FROM snapshots WHERE 1=1"
+            params = []
+            if from_dt:
+                qsql += " AND created_at >= ?"
+                params.append(from_dt.isoformat())
+            if to_dt:
+                qsql += " AND created_at <= ?"
+                params.append(to_dt.isoformat())
+            qsql += " ORDER BY id DESC LIMIT 1"
+            row = conn.execute(qsql, tuple(params)).fetchone()
+            if row:
+                snapshot_id = int(row["id"])
+
+        if mode == "fts":
+            rows = conn.execute(
+                """
+                SELECT m.chunk_id as id, f.relpath as relpath, s.id as snapshot_id,
+                       snippet(chunks_fts, 1, '[', ']', '…', 14) as snippet
+                FROM chunks_fts
+                JOIN chunks_fts_map m ON m.fts_rowid = chunks_fts.rowid
+                JOIN chunks c ON c.id = m.chunk_id
+                JOIN files f ON f.id = c.file_id
+                JOIN snapshots s ON s.id = f.snapshot_id
+                WHERE chunks_fts MATCH ?
+                  AND s.id = ?
+                LIMIT ?
+                """,
+                (q, snapshot_id, limit),
+            ).fetchall()
+            return {"snapshot_id": snapshot_id, "results": [dict(r) for r in rows]}
+
+        qv = embed_texts([q])[0]
+
+        cand = conn.execute(
+            """
+            SELECT c.id, f.relpath, c.text, c.emb_dim, c.emb
+            FROM chunks c
+            JOIN files f ON f.id = c.file_id
+            WHERE f.snapshot_id = ?
+            LIMIT 5000
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+    scored = []
+    for r in cand:
+        dim = int(r["emb_dim"])
+        v = unpack_vec(r["emb"], dim)
+        score = float(np.dot(qv, v))
+        scored.append((score, int(r["id"]), r["relpath"], r["text"][:400]))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = [{"score": s, "id": cid, "relpath": rp, "preview": pv} for s, cid, rp, pv in scored[:limit]]
+    return {"snapshot_id": snapshot_id, "results": results}
+
+@router.get("/diff")
+def diff(path: str, from_ts: int, to_ts: int):
+    rel = (path or "").strip()
+    if not rel:
+        raise HTTPException(400, "path required")
+
+    def load_text(snapshot_id: int):
+        with connect() as conn:
+            row = conn.execute(
+                """
+                SELECT f.abspath
+                FROM files f
+                WHERE f.snapshot_id=? AND f.relpath=?
+                LIMIT 1
+                """,
+                (snapshot_id, rel),
+            ).fetchone()
+        if not row:
+            return ""
+        p = Path(row["abspath"])
+        try:
+            return p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    a = load_text(from_ts)
+    b = load_text(to_ts)
+
+    diff_lines = list(
+        difflib.unified_diff(
+            a.splitlines(),
+            b.splitlines(),
+            fromfile=f"{rel}@snapshot{from_ts}",
+            tofile=f"{rel}@snapshot{to_ts}",
+            lineterm="",
+        )
+    )
+    return {
+        "path": rel,
+        "from_snapshot": from_ts,
+        "to_snapshot": to_ts,
+        "diff": "\n".join(diff_lines),
+    }
+PY
+
+cat > "$APP_DIR/app/main.py" <<'PY'
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+from .db import init_db
+from .api import router
+
+init_db()
+
+app = FastAPI(title="ChronoSearch")
+app.include_router(router, prefix="/api")
+
+BASE = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return (BASE / "static" / "index.html").read_text(encoding="utf-8")
+PY
+
+cat > "$APP_DIR/app/cli.py" <<'PY'
+import argparse
+from .indexer import create_and_index
+
+def main():
+    p = argparse.ArgumentParser(prog="chronosearch")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    i = sub.add_parser("index")
+    i.add_argument("--root", required=True)
+
+    args = p.parse_args()
+    if args.cmd == "index":
+        res = create_and_index(args.root)
+        print(res)
+
+if __name__ == "__main__":
+    main()
+PY
+
+cat > "$APP_DIR/app/__init__.py" <<'PY'
+PY
+
+cat > "$APP_DIR/app/static/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>ChronoSearch</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1100px}
+    input,select,button{font-size:14px;padding:10px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .card{border:1px solid #ddd;border-radius:12px;padding:14px;margin-top:14px}
+    .muted{color:#666}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:8px}
+    .results{display:grid;grid-template-columns:1fr;gap:10px}
+  </style>
+</head>
+<body>
+  <h1>ChronoSearch</h1>
+  <p class="muted">Local time-machine search: snapshots + FTS + semantic + diff.</p>
+
+  <div class="card">
+    <h3>1) Index now</h3>
+    <div class="row">
+      <input id="root" style="flex:1;min-width:360px" placeholder="Root path (inside container) e.g. /data"/>
+      <button onclick="indexNow()">Index</button>
+    </div>
+    <div id="idxStatus" class="muted" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h3>2) Snapshots</h3>
+    <button onclick="loadSnaps()">Refresh</button>
+    <pre id="snaps"></pre>
+  </div>
+
+  <div class="card">
+    <h3>3) Search</h3>
+    <div class="row">
+      <input id="q" style="flex:1;min-width:360px" placeholder="Query…"/>
+      <select id="mode">
+        <option value="semantic">semantic</option>
+        <option value="fts">fts</option>
+      </select>
+      <input id="from" placeholder="from YYYY-MM-DD (optional)"/>
+      <input id="to" placeholder="to YYYY-MM-DD (optional)"/>
+      <button onclick="search()">Search</button>
+    </div>
+    <div id="sStatus" class="muted" style="margin-top:8px"></div>
+    <div id="results" class="results" style="margin-top:10px"></div>
+  </div>
+
+  <script>
+    async function indexNow(){
+      const root = document.getElementById('root').value.trim();
+      const el = document.getElementById('idxStatus');
+      el.textContent = 'Queued…';
+      const r = await fetch('/api/index', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({root})
+      });
+      const j = await r.json().catch(()=>({}));
+      el.textContent = r.ok ? 'OK queued. Refresh snapshots in a bit.' : ('Error: ' + (j.detail||r.status));
+    }
+
+    async function loadSnaps(){
+      const r = await fetch('/api/snapshots');
+      const j = await r.json();
+      document.getElementById('snaps').textContent = JSON.stringify(j, null, 2);
+    }
+
+    function esc(s){
+      return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')
+    }
+
+    async function search(){
+      const q = document.getElementById('q').value.trim();
+      const mode = document.getElementById('mode').value;
+      const from = document.getElementById('from').value.trim();
+      const to = document.getElementById('to').value.trim();
+      const st = document.getElementById('sStatus');
+      const out = document.getElementById('results');
+      out.innerHTML = '';
+      st.textContent = 'Searching…';
+
+      const url = new URL(location.origin + '/api/search');
+      url.searchParams.set('q', q);
+      url.searchParams.set('mode', mode);
+      if(from) url.searchParams.set('from_', from);
+      if(to) url.searchParams.set('to', to);
+
+      const r = await fetch(url);
+      const j = await r.json().catch(()=>({}));
+
+      if(!r.ok){
+        st.textContent = 'Error: ' + (j.detail||r.status);
+        return;
+      }
+
+      st.textContent = `snapshot_id=${j.snapshot_id ?? ''} results=${(j.results||[]).length}`;
+
+      for(const it of (j.results||[])){
+        const d = document.createElement('div');
+        d.className = 'card';
+        if(mode === 'fts'){
+          d.innerHTML = `<div><b>${esc(it.relpath)}</b></div><div>${esc(it.snippet||'')}</div>`;
+        } else {
+          d.innerHTML = `<div><b>${esc(it.relpath)}</b> <span class="muted">score=${Number(it.score).toFixed(4)}</span></div><div>${esc(it.preview||'')}</div>`;
+        }
+        out.appendChild(d);
+      }
+    }
+
+    loadSnaps();
+  </script>
+</body>
+</html>
+HTML
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Open:"
+echo "  http://localhost:${PORT}"
+echo
+echo "Index your mounted data folder:"
+echo "  Put files into ./${APP_DIR}/data on your host, then in UI use root: /data"
