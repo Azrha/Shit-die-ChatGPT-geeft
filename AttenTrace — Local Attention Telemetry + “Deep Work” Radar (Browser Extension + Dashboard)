@@ -1,0 +1,874 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="attentrace"
+PORT="8855"
+API_BASE="http://localhost:${PORT}"
+
+mkdir -p "$APP_DIR"/{backend/app,backend/app/static,extension}
+
+# =========================
+# README
+# =========================
+cat > "$APP_DIR/README.md" <<'MD'
+# AttenTrace — Local Attention Telemetry + Deep Work Radar
+
+## What you get
+- **Browser extension (Manifest V3)**: logs active tab URL/title + focus/idle state at a fixed cadence.
+- **Local backend + dashboard**: stores to SQLite and shows timeline, top domains, context switches, deep-work blocks.
+
+## 1) Run backend
+~~~bash
+cd backend
+docker compose up --build
+~~~
+
+Open dashboard:
+- http://localhost:8855
+
+## 2) Load extension (Chrome / Brave / Edge)
+- Go to `chrome://extensions`
+- Enable **Developer mode**
+- Click **Load unpacked**
+- Select the folder: `attentrace/extension`
+- Then click the extension icon → **Start**
+
+## Notes
+- Data is stored in: `attentrace/backend/data/attentrace.sqlite3`
+- Extension posts to: `http://localhost:8855/api/ingest`
+MD
+
+# =========================
+# BACKEND: docker compose + Dockerfile + requirements
+# =========================
+cat > "$APP_DIR/backend/docker-compose.yml" <<EOF
+services:
+  attentrace:
+    build: .
+    environment:
+      DATA_DIR: /data
+      ATTEN_DB: /data/attentrace.sqlite3
+      PORT: "8000"
+    volumes:
+      - ./data:/data
+    ports:
+      - "${PORT}:8000"
+EOF
+
+cat > "$APP_DIR/backend/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/backend/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+REQ
+
+# =========================
+# BACKEND: DB
+# =========================
+cat > "$APP_DIR/backend/app/db.py" <<'PY'
+import os
+import sqlite3
+from pathlib import Path
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+DB_PATH = Path(os.getenv("ATTEN_DB", str(DATA_DIR / "attentrace.sqlite3"))).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def connect() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
+    return c
+
+def init_db() -> None:
+    with connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts_ms INTEGER NOT NULL,
+              source TEXT NOT NULL, -- extension id / 'mv3'
+              kind TEXT NOT NULL,   -- sample|focus|idle
+              url TEXT,
+              title TEXT,
+              domain TEXT,
+              window_id INTEGER,
+              tab_id INTEGER,
+              audible INTEGER,
+              incognito INTEGER,
+              idle_state TEXT,      -- active|idle|locked
+              meta_json TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts_ms);
+            CREATE INDEX IF NOT EXISTS idx_events_domain_ts ON events(domain, ts_ms);
+            """
+        )
+PY
+
+# =========================
+# BACKEND: logic
+# =========================
+cat > "$APP_DIR/backend/app/logic.py" <<'PY'
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
+from typing import Any, Dict, List, Tuple
+
+def domain_of(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        return host or None
+    except Exception:
+        return None
+
+def day_bounds_utc(date_yyyy_mm_dd: str) -> Tuple[int, int]:
+    d = datetime.fromisoformat(date_yyyy_mm_dd).replace(tzinfo=timezone.utc)
+    start = int(d.timestamp() * 1000)
+    end = int((d + timedelta(days=1)).timestamp() * 1000) - 1
+    return start, end
+
+def now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def parse_json(s: str | None) -> Any:
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+def dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False)
+
+def rollup_sessions(events: List[Dict[str, Any]], gap_ms: int = 120_000) -> List[Dict[str, Any]]:
+    """
+    Turn raw events into 'sessions' per domain+url (best effort):
+    - consecutive samples of same (domain,url) form a block
+    - if gap > gap_ms or url changes -> new block
+    """
+    out: List[Dict[str, Any]] = []
+    cur: Dict[str, Any] | None = None
+
+    def flush():
+        nonlocal cur
+        if cur:
+            cur["seconds"] = max(0, int((cur["end_ms"] - cur["start_ms"]) / 1000))
+            out.append(cur)
+            cur = None
+
+    for e in events:
+        if e.get("kind") not in ("sample", "focus"):
+            continue
+
+        ts = int(e["ts_ms"])
+        url = e.get("url") or ""
+        dom = e.get("domain") or ""
+        title = e.get("title") or ""
+        idle_state = e.get("idle_state") or "active"
+
+        if idle_state != "active":
+            flush()
+            continue
+
+        key = (dom, url)
+        if cur is None:
+            cur = {
+                "start_ms": ts,
+                "end_ms": ts,
+                "domain": dom,
+                "url": url,
+                "title": title,
+                "events": 1,
+            }
+            continue
+
+        prev_key = (cur["domain"], cur["url"])
+        if key == prev_key and (ts - cur["end_ms"]) <= gap_ms:
+            cur["end_ms"] = ts
+            cur["events"] += 1
+            if title and len(title) > len(cur.get("title") or ""):
+                cur["title"] = title
+        else:
+            flush()
+            cur = {
+                "start_ms": ts,
+                "end_ms": ts,
+                "domain": dom,
+                "url": url,
+                "title": title,
+                "events": 1,
+            }
+
+    flush()
+    return out
+
+def deep_work_blocks(sessions: List[Dict[str, Any]], min_seconds: int = 1500) -> List[Dict[str, Any]]:
+    """
+    Deep work heuristic:
+    - blocks >= min_seconds
+    - returns those sessions
+    """
+    return [s for s in sessions if int(s.get("seconds", 0)) >= min_seconds]
+
+def context_switches(sessions: List[Dict[str, Any]]) -> int:
+    if not sessions:
+        return 0
+    switches = 0
+    last = (sessions[0]["domain"], sessions[0]["url"])
+    for s in sessions[1:]:
+        k = (s["domain"], s["url"])
+        if k != last:
+            switches += 1
+            last = k
+    return switches
+PY
+
+# =========================
+# BACKEND: API
+# =========================
+cat > "$APP_DIR/backend/app/main.py" <<'PY'
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from .db import init_db, connect
+from .logic import (
+    domain_of,
+    dumps,
+    parse_json,
+    rollup_sessions,
+    deep_work_blocks,
+    context_switches,
+    day_bounds_utc,
+)
+
+init_db()
+
+app = FastAPI(title="AttenTrace")
+BASE = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return (BASE / "static" / "index.html").read_text(encoding="utf-8")
+
+class IngestEvent(BaseModel):
+    ts_ms: int = Field(..., ge=0)
+    source: str = Field(default="mv3")
+    kind: str = Field(..., min_length=1)
+    url: Optional[str] = None
+    title: Optional[str] = None
+    window_id: Optional[int] = None
+    tab_id: Optional[int] = None
+    audible: Optional[bool] = None
+    incognito: Optional[bool] = None
+    idle_state: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+@app.post("/api/ingest")
+async def ingest(ev: IngestEvent, request: Request):
+    dom = domain_of(ev.url)
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO events(ts_ms, source, kind, url, title, domain, window_id, tab_id, audible, incognito, idle_state, meta_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(ev.ts_ms),
+                ev.source,
+                ev.kind,
+                ev.url,
+                ev.title,
+                dom,
+                ev.window_id,
+                ev.tab_id,
+                1 if ev.audible else 0 if ev.audible is not None else None,
+                1 if ev.incognito else 0 if ev.incognito is not None else None,
+                ev.idle_state,
+                dumps(ev.meta),
+            ),
+        )
+    return {"ok": True}
+
+@app.get("/api/timeline")
+def timeline(date: Optional[str] = None, limit: int = 2000):
+    """
+    Return events for a UTC day, plus rolled-up sessions.
+    date: YYYY-MM-DD (UTC). Defaults to today (UTC).
+    """
+    if date is None:
+        import datetime
+        date = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
+    start_ms, end_ms = day_bounds_utc(date)
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT * FROM events
+            WHERE ts_ms BETWEEN ? AND ?
+            ORDER BY ts_ms ASC
+            LIMIT ?
+            """,
+            (start_ms, end_ms, int(limit)),
+        ).fetchall()
+
+    events = [dict(r) for r in rows]
+    for e in events:
+        e["meta"] = parse_json(e.get("meta_json"))
+        e.pop("meta_json", None)
+
+    sessions = rollup_sessions(events)
+    deep = deep_work_blocks(sessions)
+    switches = context_switches(sessions)
+
+    return {
+        "date_utc": date,
+        "events": events,
+        "sessions": sessions,
+        "deep_work_blocks": deep,
+        "context_switches": switches,
+    }
+
+@app.get("/api/top_domains")
+def top_domains(days: int = 7, limit: int = 25):
+    days = max(1, min(60, int(days)))
+    limit = max(1, min(200, int(limit)))
+
+    import datetime
+    end = datetime.datetime.now(datetime.timezone.utc)
+    start = end - datetime.timedelta(days=days)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT domain, COUNT(*) AS samples
+            FROM events
+            WHERE ts_ms BETWEEN ? AND ?
+              AND kind IN ('sample','focus')
+              AND idle_state='active'
+              AND domain IS NOT NULL
+            GROUP BY domain
+            ORDER BY samples DESC
+            LIMIT ?
+            """,
+            (start_ms, end_ms, limit),
+        ).fetchall()
+
+    return {"days": days, "top": [dict(r) for r in rows]}
+
+@app.get("/api/health")
+def health():
+    with connect() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM events").fetchone()
+    return {"ok": True, "events": int(row["n"])}
+PY
+
+# =========================
+# BACKEND: UI
+# =========================
+cat > "$APP_DIR/backend/app/static/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>AttenTrace</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1250px}
+    input,button,select{font-size:14px;padding:10px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;margin:14px 0}
+    .muted{color:#666}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:10px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left;vertical-align:top}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #ddd;border-radius:999px;margin-left:6px}
+    .good{border-color:#bbb}
+  </style>
+</head>
+<body>
+  <h1>AttenTrace</h1>
+  <p class="muted">Local attention telemetry: active tabs → events → sessions → deep work blocks.</p>
+
+  <div class="card">
+    <div class="row">
+      <button onclick="health()">Health</button>
+      <span id="h" class="muted"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Timeline (UTC day)</h3>
+    <div class="row">
+      <input id="date" placeholder="YYYY-MM-DD (UTC)"/>
+      <button onclick="loadTimeline()">Load</button>
+    </div>
+    <div id="stats" class="muted" style="margin-top:10px"></div>
+    <div id="deep" style="margin-top:10px"></div>
+    <div id="sessions" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h3>Top domains</h3>
+    <div class="row">
+      <input id="days" placeholder="days (1-60)" value="7"/>
+      <button onclick="topDomains()">Load</button>
+    </div>
+    <div id="top"></div>
+  </div>
+
+  <script>
+    const $ = (id)=>document.getElementById(id);
+
+    function esc(s){
+      return String(s??"").replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+    }
+
+    function fmtMs(ms){
+      const d = new Date(ms);
+      return d.toISOString().replace('T',' ').replace('Z',' UTC');
+    }
+
+    function fmtDur(sec){
+      sec = Number(sec||0);
+      const h = Math.floor(sec/3600);
+      const m = Math.floor((sec%3600)/60);
+      const s = sec%60;
+      if(h) return `${h}h ${m}m`;
+      if(m) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    async function health(){
+      const r = await fetch('/api/health');
+      const j = await r.json().catch(()=>({}));
+      $('h').textContent = r.ok ? `ok | events=${j.events}` : 'error';
+    }
+
+    async function loadTimeline(){
+      const date = $('date').value.trim();
+      const url = new URL(location.origin + '/api/timeline');
+      if(date) url.searchParams.set('date', date);
+
+      const r = await fetch(url);
+      const j = await r.json().catch(()=>({}));
+      if(!r.ok){ $('stats').textContent = 'Error'; return; }
+
+      const sessions = j.sessions || [];
+      const deep = j.deep_work_blocks || [];
+      const switches = j.context_switches ?? 0;
+      const totalSec = sessions.reduce((a,s)=>a+(s.seconds||0),0);
+
+      $('stats').innerHTML = `
+        <b>${esc(j.date_utc)}</b>
+        <span class="pill">sessions=${sessions.length}</span>
+        <span class="pill">deep_blocks=${deep.length}</span>
+        <span class="pill">switches=${switches}</span>
+        <span class="pill">tracked=${fmtDur(totalSec)}</span>
+      `;
+
+      const deepDiv = $('deep');
+      deepDiv.innerHTML = '<h4>Deep work blocks (≥25m)</h4>';
+      if(!deep.length){
+        deepDiv.innerHTML += '<div class="muted">none</div>';
+      } else {
+        const t = document.createElement('table');
+        t.innerHTML = '<thead><tr><th>start</th><th>end</th><th>duration</th><th>domain</th><th>title</th></tr></thead>';
+        const tb = document.createElement('tbody');
+        for(const b of deep){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${esc(fmtMs(b.start_ms))}</td>
+            <td>${esc(fmtMs(b.end_ms))}</td>
+            <td>${esc(fmtDur(b.seconds))}</td>
+            <td><b>${esc(b.domain)}</b></td>
+            <td>${esc(b.title||'')}</td>
+          `;
+          tb.appendChild(tr);
+        }
+        t.appendChild(tb);
+        deepDiv.appendChild(t);
+      }
+
+      const sDiv = $('sessions');
+      sDiv.innerHTML = '<h4>Sessions</h4>';
+      const t = document.createElement('table');
+      t.innerHTML = '<thead><tr><th>start</th><th>duration</th><th>domain</th><th>title</th><th>url</th></tr></thead>';
+      const tb = document.createElement('tbody');
+      for(const s of sessions){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${esc(fmtMs(s.start_ms))}</td>
+          <td>${esc(fmtDur(s.seconds))}</td>
+          <td><b>${esc(s.domain)}</b></td>
+          <td>${esc(s.title||'')}</td>
+          <td><span class="muted">${esc((s.url||'').slice(0,120))}</span></td>
+        `;
+        tb.appendChild(tr);
+      }
+      t.appendChild(tb);
+      sDiv.appendChild(t);
+    }
+
+    async function topDomains(){
+      const days = $('days').value.trim() || "7";
+      const url = new URL(location.origin + '/api/top_domains');
+      url.searchParams.set('days', days);
+
+      const r = await fetch(url);
+      const j = await r.json().catch(()=>({}));
+      const div = $('top');
+      if(!r.ok){ div.textContent = 'Error'; return; }
+
+      const arr = j.top || [];
+      const t = document.createElement('table');
+      t.innerHTML = '<thead><tr><th>domain</th><th>samples</th></tr></thead>';
+      const tb = document.createElement('tbody');
+      for(const it of arr){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td><b>${esc(it.domain)}</b></td><td>${esc(it.samples)}</td>`;
+        tb.appendChild(tr);
+      }
+      t.appendChild(tb);
+      div.innerHTML = '';
+      div.appendChild(t);
+    }
+
+    (function init(){
+      const d = new Date();
+      $('date').value = d.toISOString().slice(0,10);
+      health();
+      loadTimeline();
+      topDomains();
+    })();
+  </script>
+</body>
+</html>
+HTML
+
+# =========================
+# EXTENSION: MV3 manifest + service worker + popup
+# =========================
+cat > "$APP_DIR/extension/manifest.json" <<EOF
+{
+  "manifest_version": 3,
+  "name": "AttenTrace",
+  "version": "1.0.0",
+  "description": "Local attention telemetry: active tab sampling + idle detection + dashboard on localhost.",
+  "action": {
+    "default_title": "AttenTrace",
+    "default_popup": "popup.html"
+  },
+  "permissions": [
+    "tabs",
+    "alarms",
+    "idle",
+    "storage",
+    "notifications"
+  ],
+  "host_permissions": [
+    "http://localhost:${PORT}/*"
+  ],
+  "background": {
+    "service_worker": "sw.js",
+    "type": "module"
+  }
+}
+EOF
+
+cat > "$APP_DIR/extension/popup.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>AttenTrace</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:14px;min-width:320px}
+    button,input{font-size:14px;padding:10px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .muted{color:#666}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:8px}
+  </style>
+</head>
+<body>
+  <h3 style="margin:0 0 10px 0">AttenTrace</h3>
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+  </div>
+
+  <div style="margin-top:10px" class="row">
+    <label class="muted">Sample seconds</label>
+    <input id="interval" type="number" min="5" max="300" value="15" style="width:90px"/>
+    <button id="save">Save</button>
+  </div>
+
+  <p class="muted" style="margin-top:10px">Backend: <code id="api"></code></p>
+  <p class="muted" id="status"></p>
+
+  <script>
+    async function getCfg(){
+      return await chrome.storage.local.get(["enabled","interval_s","api_base"]);
+    }
+    async function setCfg(v){
+      await chrome.storage.local.set(v);
+    }
+    function setStatus(s){
+      document.getElementById("status").textContent = s;
+    }
+
+    document.getElementById("api").textContent = "http://localhost:8855";
+
+    (async function init(){
+      const cfg = await getCfg();
+      document.getElementById("interval").value = cfg.interval_s || 15;
+      setStatus(cfg.enabled ? "enabled" : "disabled");
+    })();
+
+    document.getElementById("start").onclick = async () => {
+      await setCfg({enabled:true});
+      await chrome.runtime.sendMessage({type:"ATTEN_START"});
+      setStatus("enabled");
+    };
+
+    document.getElementById("stop").onclick = async () => {
+      await setCfg({enabled:false});
+      await chrome.runtime.sendMessage({type:"ATTEN_STOP"});
+      setStatus("disabled");
+    };
+
+    document.getElementById("save").onclick = async () => {
+      const n = Number(document.getElementById("interval").value || 15);
+      const interval = Math.max(5, Math.min(300, n));
+      await setCfg({interval_s: interval});
+      await chrome.runtime.sendMessage({type:"ATTEN_RECONFIG"});
+      setStatus("saved");
+    };
+  </script>
+</body>
+</html>
+HTML
+
+cat > "$APP_DIR/extension/sw.js" <<EOF
+const API_BASE = "${API_BASE}";
+const ALARM_NAME = "attentrace_sample";
+
+async function getCfg(){
+  const cfg = await chrome.storage.local.get(["enabled","interval_s","idle_threshold_s"]);
+  return {
+    enabled: cfg.enabled ?? false,
+    interval_s: cfg.interval_s ?? 15,
+    idle_threshold_s: cfg.idle_threshold_s ?? 60
+  };
+}
+
+async function postEvent(payload){
+  try{
+    await fetch(API_BASE + "/api/ingest", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+  }catch(e){}
+}
+
+function domainOf(url){
+  try{
+    const u = new URL(url);
+    return (u.hostname || "").toLowerCase();
+  }catch(e){
+    return null;
+  }
+}
+
+async function getActiveTab(){
+  try{
+    const [tab] = await chrome.tabs.query({active:true, currentWindow:true});
+    return tab || null;
+  }catch(e){
+    return null;
+  }
+}
+
+async function ensureAlarm(){
+  const cfg = await getCfg();
+  await chrome.alarms.clear(ALARM_NAME);
+  if(!cfg.enabled) return;
+  chrome.alarms.create(ALARM_NAME, {periodInMinutes: Math.max(0.1, cfg.interval_s / 60)});
+}
+
+async function sample(kind="sample"){
+  const cfg = await getCfg();
+  if(!cfg.enabled) return;
+
+  let idleState = "active";
+  try{
+    idleState = await chrome.idle.queryState(cfg.idle_threshold_s);
+  }catch(e){}
+
+  const tab = await getActiveTab();
+  const ts_ms = Date.now();
+
+  const url = tab?.url || null;
+  const title = tab?.title || null;
+
+  await postEvent({
+    ts_ms,
+    source: "mv3",
+    kind,
+    url,
+    title,
+    window_id: tab?.windowId ?? null,
+    tab_id: tab?.id ?? null,
+    audible: tab?.audible ?? null,
+    incognito: tab?.incognito ?? null,
+    idle_state: idleState,
+    meta: {
+      domain: domainOf(url),
+      pinned: tab?.pinned ?? null
+    }
+  });
+}
+
+async function notifyIfSwitchStorm(){
+  const key = "focus_events";
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000;
+
+  const s = await chrome.storage.local.get([key]);
+  const arr = Array.isArray(s[key]) ? s[key] : [];
+  const fresh = arr.filter(t => (now - t) <= windowMs);
+  fresh.push(now);
+
+  await chrome.storage.local.set({[key]: fresh});
+
+  if(fresh.length >= 14){
+    try{
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: "icon.png",
+        title: "AttenTrace",
+        message: "High context switching detected (14+ focus changes in 10 minutes)."
+      });
+      await chrome.storage.local.set({[key]: []});
+    }catch(e){}
+  }
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await chrome.storage.local.set({api_base: API_BASE});
+  await ensureAlarm();
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await ensureAlarm();
+});
+
+chrome.alarms.onAlarm.addListener(async (a) => {
+  if(a && a.name === ALARM_NAME){
+    await sample("sample");
+  }
+});
+
+chrome.tabs.onActivated.addListener(async () => {
+  await sample("focus");
+  await notifyIfSwitchStorm();
+});
+
+chrome.windows.onFocusChanged.addListener(async () => {
+  await sample("focus");
+  await notifyIfSwitchStorm();
+});
+
+chrome.idle.onStateChanged.addListener(async (state) => {
+  await postEvent({
+    ts_ms: Date.now(),
+    source: "mv3",
+    kind: "idle",
+    url: null,
+    title: null,
+    window_id: null,
+    tab_id: null,
+    audible: null,
+    incognito: null,
+    idle_state: state,
+    meta: {}
+  });
+});
+
+chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
+  (async () => {
+    if(!msg || !msg.type) return;
+
+    if(msg.type === "ATTEN_START"){
+      await chrome.storage.local.set({enabled:true});
+      await ensureAlarm();
+      await sample("focus");
+    } else if(msg.type === "ATTEN_STOP"){
+      await chrome.storage.local.set({enabled:false});
+      await chrome.alarms.clear(ALARM_NAME);
+    } else if(msg.type === "ATTEN_RECONFIG"){
+      await ensureAlarm();
+    }
+  })();
+});
+EOF
+
+# icon (tiny 1x1 png)
+python3 - <<'PY'
+import base64, pathlib
+
+b = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6X9l0sAAAAASUVORK5CYII="
+)
+pathlib.Path("attentrace/extension/icon.png").write_bytes(b)
+PY
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Backend:"
+echo "  cd $APP_DIR/backend && docker compose up --build"
+echo "Dashboard:"
+echo "  http://localhost:${PORT}"
+echo
+echo "Extension:"
+echo "  Load unpacked: $APP_DIR/extension"
