@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="signalforge"
+GRAFANA_PORT="8866"
+PROM_PORT="9090"
+LOKI_PORT="3100"
+TEMPO_PORT="3200"
+OTEL_GRPC="4317"
+OTEL_HTTP="4318"
+
+mkdir -p "$APP_DIR"/{grafana/provisioning/datasources,grafana/provisioning/dashboards,otel,tempo,loki,prometheus,app}
+
+# -------------------------
+# README (uses ~~~ to avoid nested ``` issues)
+# -------------------------
+cat > "$APP_DIR/README.md" <<MD
+# SignalForge — Local Observability Fabric (OTel → Tempo/Loki/Prometheus → Grafana)
+
+## Run
+~~~bash
+docker compose up --build
+~~~
+
+## URLs
+- Grafana: http://localhost:${GRAFANA_PORT}  (admin / admin)
+- Prometheus: http://localhost:${PROM_PORT}
+- Loki: http://localhost:${LOKI_PORT}
+- Tempo: http://localhost:${TEMPO_PORT}
+- OTel Collector OTLP gRPC: localhost:${OTEL_GRPC}
+- OTel Collector OTLP HTTP:  localhost:${OTEL_HTTP}
+
+## Demo app
+A small FastAPI app is included and auto-instrumented with OpenTelemetry (zero-code instrumentation).
+- App: http://localhost:8877
+- Generate traffic: open /ping a few times.
+
+## Notes
+- Logs: Collector exports OTLP logs to Loki’s OTLP endpoint.
+- Traces: Collector exports OTLP traces to Tempo.
+- Metrics: Collector exposes a Prometheus scrape endpoint.
+MD
+
+# -------------------------
+# docker-compose
+# -------------------------
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_USERS_DEFAULT_THEME=dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "${PROM_PORT}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki/config.yml"]
+    ports:
+      - "${LOKI_PORT}:3100"
+    volumes:
+      - ./loki/config.yml:/etc/loki/config.yml:ro
+
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo/config.yml"]
+    ports:
+      - "${TEMPO_PORT}:3200"
+      - "4319:4317"   # tempo otlp grpc (internal use optional)
+    volumes:
+      - ./tempo/config.yml:/etc/tempo/config.yml:ro
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel/config.yml"]
+    ports:
+      - "${OTEL_GRPC}:4317"
+      - "${OTEL_HTTP}:4318"
+      - "9464:9464"   # prometheus exporter endpoint
+    volumes:
+      - ./otel/config.yml:/etc/otel/config.yml:ro
+    depends_on:
+      - loki
+      - tempo
+
+  demo-app:
+    build: ./app
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_SERVICE_NAME=demo-app
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=otlp
+      - OTEL_LOGS_EXPORTER=otlp
+      - OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
+    ports:
+      - "8877:8877"
+    depends_on:
+      - otel-collector
+EOF
+
+# -------------------------
+# Grafana provisioning: datasources
+# -------------------------
+cat > "$APP_DIR/grafana/provisioning/datasources/datasources.yml" <<'YAML'
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      httpMethod: GET
+      tracesToLogs:
+        datasourceUid: Loki
+      tracesToMetrics:
+        datasourceUid: Prometheus
+YAML
+
+cat > "$APP_DIR/grafana/provisioning/dashboards/dashboards.yml" <<'YAML'
+apiVersion: 1
+providers:
+  - name: "default"
+    type: file
+    disableDeletion: true
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+YAML
+
+# -------------------------
+# Prometheus config (scrape otel collector exporter)
+# -------------------------
+cat > "$APP_DIR/prometheus/prometheus.yml" <<'YAML'
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: "otel-collector"
+    static_configs:
+      - targets: ["otel-collector:9464"]
+YAML
+
+# -------------------------
+# Loki config (enable OTLP endpoint)
+# Grafana docs: Loki supports OTLP ingestion and collector can send OTLP logs to Loki. (docs cited in response)
+# -------------------------
+cat > "$APP_DIR/loki/config.yml" <<'YAML'
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+
+# OTLP ingestion is enabled via the "otlp" section in newer Loki configs.
+# Loki images have OTLP enabled by default in many examples; this block keeps it explicit.
+otlp:
+  http:
+    enabled: true
+YAML
+
+# -------------------------
+# Tempo config (OTLP receiver)
+# -------------------------
+cat > "$APP_DIR/tempo/config.yml" <<'YAML'
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+        http:
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo/traces
+YAML
+
+# -------------------------
+# OTel Collector config: OTLP in → Tempo (traces), Loki (logs), Prometheus exporter (metrics)
+# -------------------------
+cat > "$APP_DIR/otel/config.yml" <<'YAML'
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+
+exporters:
+  # Traces → Tempo (OTLP gRPC)
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Logs → Loki OTLP HTTP endpoint
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+  # Metrics → Prometheus scrape endpoint
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    enable_open_metrics: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]
+
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki]
+
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+YAML
+
+# -------------------------
+# Demo app (FastAPI) + OpenTelemetry zero-code instrumentation
+# -------------------------
+cat > "$APP_DIR/app/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /srv
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
+
+EXPOSE 8877
+
+# Zero-code instrumentation via opentelemetry-instrument
+CMD ["opentelemetry-instrument", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8877"]
+DOCKER
+
+cat > "$APP_DIR/app/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# OpenTelemetry Python zero-code instrumentation (distro required)
+opentelemetry-distro==0.52b0
+opentelemetry-exporter-otlp==1.27.0
+
+# Instrumentations
+opentelemetry-instrumentation==0.52b0
+opentelemetry-instrumentation-fastapi==0.52b0
+opentelemetry-instrumentation-requests==0.52b0
+REQ
+
+cat > "$APP_DIR/app/main.py" <<'PY'
+import time
+import random
+import logging
+import requests
+from fastapi import FastAPI
+
+log = logging.getLogger("demo")
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI(title="SignalForge Demo App")
+
+@app.get("/")
+def root():
+    log.info("root hit")
+    return {"ok": True, "msg": "SignalForge demo app"}
+
+@app.get("/ping")
+def ping():
+    # simulate some work + jitter
+    t = random.uniform(0.02, 0.25)
+    time.sleep(t)
+    log.info("ping work_seconds=%0.3f", t)
+
+    # make a downstream request to generate extra spans
+    try:
+        requests.get("https://example.com", timeout=2)
+    except Exception as e:
+        log.warning("downstream failed: %s", e)
+
+    return {"pong": True, "work_seconds": round(t, 3)}
+PY
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Grafana:"
+echo "  http://localhost:${GRAFANA_PORT}  (admin/admin)"
+echo
+echo "Demo app:"
+echo "  http://localhost:8877/ping"
