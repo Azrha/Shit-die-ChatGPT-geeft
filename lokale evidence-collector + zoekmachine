@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== VARIABLES (edit if you want) =====
+APP_DIR="evidence-vault"
+HOST_PORT="8787"
+# Optional: set your Ollama base url. Leave empty to disable summaries.
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-gemma3:4b}"
+
+mkdir -p "$APP_DIR"/{app,app/static,data}
+
+cat > "$APP_DIR/README.md" <<'MD'
+# Evidence Vault (local-first)
+
+Run:
+- docker compose up --build
+
+Open:
+- http://localhost:8787
+
+Env (optional):
+- OLLAMA_BASE_URL (default http://localhost:11434)
+- OLLAMA_MODEL (default gemma3:4b)
+MD
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  api:
+    build: .
+    environment:
+      - DATA_DIR=/data
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+    volumes:
+      - ./data:/data
+    ports:
+      - "${HOST_PORT}:8000"
+EOF
+
+cat > "$APP_DIR/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+httpx==0.27.2
+beautifulsoup4==4.12.3
+lxml==5.3.0
+python-multipart==0.0.17
+REQ
+
+cat > "$APP_DIR/app/main.py" <<'PY'
+import os
+import re
+import json
+import time
+import hashlib
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+APP_NAME = "Evidence Vault"
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+DB_PATH = DATA_DIR / "vault.sqlite3"
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "").strip()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title=APP_NAME)
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+def _normalize_text(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+def init_db() -> None:
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS documents (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          url TEXT NOT NULL,
+          title TEXT,
+          fetched_at TEXT NOT NULL,
+          http_status INTEGER,
+          content_type TEXT,
+          raw_sha256 TEXT NOT NULL,
+          text_sha256 TEXT NOT NULL,
+          raw_bytes BLOB,
+          text TEXT,
+          summary TEXT
+        );
+
+        -- FTS5 full-text index (contentless; we sync manually)
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+          title,
+          text,
+          content='',
+          tokenize='unicode61'
+        );
+
+        CREATE TABLE IF NOT EXISTS documents_fts_map (
+          doc_id INTEGER PRIMARY KEY,
+          fts_rowid INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_documents_url ON documents(url);
+        """)
+init_db()
+
+class IngestRequest(BaseModel):
+    url: str = Field(..., min_length=5, max_length=4096)
+
+class IngestResponse(BaseModel):
+    id: int
+    status: str
+
+class SearchResponse(BaseModel):
+    results: List[Dict[str, Any]]
+
+class SummarizeResponse(BaseModel):
+    id: int
+    status: str
+
+def extract_text_from_html(html_bytes: bytes) -> (str, str):
+    soup = BeautifulSoup(html_bytes, "lxml")
+    title = (soup.title.string.strip() if soup.title and soup.title.string else None)
+
+    # Remove scripts/styles
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = soup.get_text(" ")
+    text = _normalize_text(text)
+    return title or "", text
+
+def fts_upsert(conn: sqlite3.Connection, doc_id: int, title: str, text: str) -> None:
+    # Remove old mapping if exists
+    row = conn.execute("SELECT fts_rowid FROM documents_fts_map WHERE doc_id=?", (doc_id,)).fetchone()
+    if row:
+        conn.execute("DELETE FROM documents_fts WHERE rowid=?", (row["fts_rowid"],))
+        conn.execute("DELETE FROM documents_fts_map WHERE doc_id=?", (doc_id,))
+
+    cur = conn.execute("INSERT INTO documents_fts(title, text) VALUES (?, ?)", (title, text))
+    fts_rowid = cur.lastrowid
+    conn.execute("INSERT INTO documents_fts_map(doc_id, fts_rowid) VALUES (?, ?)", (doc_id, fts_rowid))
+
+async def fetch_url(url: str) -> Dict[str, Any]:
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    headers = {
+        "User-Agent": "EvidenceVault/1.0 (+local-first; contact: none)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        r = await client.get(url)
+        raw = r.content
+        ct = r.headers.get("content-type", "")
+        return {"status": r.status_code, "content_type": ct, "raw": raw}
+
+async def ollama_summarize(text: str) -> str:
+    if not OLLAMA_BASE_URL:
+        raise RuntimeError("OLLAMA_BASE_URL not set")
+    # Use /api/generate per docs
+    # https://docs.ollama.com/api/generate
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": (
+            "Summarize the following document in 6-10 bullet points. "
+            "Then add: (1) key claims, (2) risks/assumptions, (3) actionable takeaways.\n\n"
+            + text[:12000]
+        ),
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+        r = await client.post(f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        # Ollama returns {"response": "...", ...}
+        return _normalize_text(data.get("response", ""))
+
+def ingest_background(doc_id: int) -> None:
+    # This runs after returning response (FastAPI BackgroundTasks)
+    # https://fastapi.tiangolo.com/tutorial/background-tasks/
+    with db() as conn:
+        row = conn.execute("SELECT url FROM documents WHERE id=?", (doc_id,)).fetchone()
+        if not row:
+            return
+        url = row["url"]
+
+    # Do async fetch in sync context
+    import asyncio
+    fetched = asyncio.run(fetch_url(url))
+
+    raw = fetched["raw"]
+    status = int(fetched["status"])
+    ct = fetched["content_type"] or ""
+
+    title = ""
+    text = ""
+    if "html" in ct or raw.strip().startswith(b"<!doctype") or b"<html" in raw[:500].lower():
+        title, text = extract_text_from_html(raw)
+    else:
+        # store as best-effort decoded text
+        try:
+            text = _normalize_text(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            text = ""
+
+    raw_sha = _sha256_bytes(raw)
+    text_sha = _sha256_bytes(text.encode("utf-8"))
+
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE documents
+            SET fetched_at=?, http_status=?, content_type=?, raw_sha256=?, text_sha256=?, raw_bytes=?, title=?, text=?
+            WHERE id=?
+            """,
+            (_utc_now_iso(), status, ct, raw_sha, text_sha, raw, title, text, doc_id),
+        )
+        fts_upsert(conn, doc_id, title, text)
+
+@app.get("/", response_class=HTMLResponse)
+def home() -> str:
+    return (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+
+@app.post("/api/ingest", response_model=IngestResponse)
+def ingest(req: IngestRequest, bg: BackgroundTasks) -> IngestResponse:
+    url = req.url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO documents(url, title, fetched_at, http_status, content_type, raw_sha256, text_sha256, raw_bytes, text, summary)
+            VALUES (?, '', ?, NULL, '', '', '', NULL, '', '')
+            """,
+            (url, _utc_now_iso()),
+        )
+        doc_id = int(cur.lastrowid)
+
+    bg.add_task(ingest_background, doc_id)
+    return IngestResponse(id=doc_id, status="queued")
+
+@app.get("/api/docs/{doc_id}")
+def get_doc(doc_id: int) -> JSONResponse:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    d = dict(row)
+    # Don't dump raw bytes to JSON; provide sizes instead
+    raw = d.pop("raw_bytes", None)
+    d["raw_size"] = len(raw) if raw else 0
+    d["text_size"] = len((d.get("text") or "").encode("utf-8"))
+    return JSONResponse(d)
+
+@app.get("/api/search", response_model=SearchResponse)
+def search(q: str) -> SearchResponse:
+    q = q.strip()
+    if not q:
+        return SearchResponse(results=[])
+
+    with db() as conn:
+        # FTS5 query
+        rows = conn.execute(
+            """
+            SELECT m.doc_id as id, f.title as title, snippet(documents_fts, 1, '[', ']', '…', 12) as snippet
+            FROM documents_fts f
+            JOIN documents_fts_map m ON m.fts_rowid = f.rowid
+            WHERE documents_fts MATCH ?
+            ORDER BY rank
+            LIMIT 50
+            """,
+            (q,),
+        ).fetchall()
+
+        results = []
+        for r in rows:
+            doc = conn.execute("SELECT url, fetched_at, http_status FROM documents WHERE id=?", (r["id"],)).fetchone()
+            results.append({
+                "id": r["id"],
+                "url": doc["url"] if doc else "",
+                "fetched_at": doc["fetched_at"] if doc else "",
+                "http_status": doc["http_status"] if doc else None,
+                "title": r["title"] or "",
+                "snippet": r["snippet"] or "",
+            })
+
+    return SearchResponse(results=results)
+
+@app.post("/api/summarize/{doc_id}", response_model=SummarizeResponse)
+def summarize(doc_id: int, bg: BackgroundTasks) -> SummarizeResponse:
+    if not OLLAMA_BASE_URL:
+        raise HTTPException(status_code=400, detail="OLLAMA_BASE_URL not set (summaries disabled)")
+
+    def _do(doc_id: int) -> None:
+        with db() as conn:
+            row = conn.execute("SELECT text FROM documents WHERE id=?", (doc_id,)).fetchone()
+        if not row:
+            return
+        text = (row["text"] or "").strip()
+        if not text:
+            return
+
+        import asyncio
+        summary = asyncio.run(ollama_summarize(text))
+
+        with db() as conn:
+            conn.execute("UPDATE documents SET summary=? WHERE id=?", (summary, doc_id))
+
+    bg.add_task(_do, doc_id)
+    return SummarizeResponse(id=doc_id, status="queued")
+
+@app.get("/api/export/{doc_id}")
+def export_bundle(doc_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    url = row["url"]
+    title = row["title"] or ""
+    fetched_at = row["fetched_at"]
+    status = row["http_status"]
+    ct = row["content_type"] or ""
+    raw_sha = row["raw_sha256"]
+    text_sha = row["text_sha256"]
+    text = row["text"] or ""
+    summary = row["summary"] or ""
+    raw = row["raw_bytes"] or b""
+
+    bundle_dir = DATA_DIR / "exports"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_id = f"doc{doc_id}_{ts}"
+    out_dir = bundle_dir / safe_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "id": doc_id,
+        "url": url,
+        "title": title,
+        "fetched_at": fetched_at,
+        "http_status": status,
+        "content_type": ct,
+        "raw_sha256": raw_sha,
+        "text_sha256": text_sha,
+        "exported_at": _utc_now_iso(),
+    }
+
+    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "document.txt").write_text(text, encoding="utf-8")
+    (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
+    (out_dir / "raw.bin").write_bytes(raw)
+
+    # manifest
+    manifest = []
+    for p in ["meta.json", "document.txt", "summary.txt", "raw.bin"]:
+        b = (out_dir / p).read_bytes()
+        manifest.append({"file": p, "sha256": _sha256_bytes(b), "bytes": len(b)})
+
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # zip it
+    import zipfile
+    zip_path = bundle_dir / f"{safe_id}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in ["meta.json", "document.txt", "summary.txt", "raw.bin", "manifest.json"]:
+            z.write(out_dir / p, arcname=p)
+
+    return FileResponse(path=str(zip_path), filename=zip_path.name, media_type="application/zip")
+PY
+
+cat > "$APP_DIR/app/static/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Evidence Vault</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1100px}
+    input,button{font-size:14px;padding:10px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .card{border:1px solid #ddd;border-radius:12px;padding:14px;margin-top:14px}
+    .muted{color:#666}
+    .results{display:grid;grid-template-columns:1fr;gap:10px}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:8px}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <h1>Evidence Vault</h1>
+  <p class="muted">Ingest URLs → full-text search → optional Ollama summary → export evidence bundle (zip + sha256 manifest).</p>
+
+  <div class="card">
+    <h3>1) Ingest URL</h3>
+    <div class="row">
+      <input id="url" style="flex:1;min-width:320px" placeholder="https://example.com/article"/>
+      <button onclick="ingest()">Ingest</button>
+    </div>
+    <div id="ingestStatus" class="muted" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h3>2) Search</h3>
+    <div class="row">
+      <input id="q" style="flex:1;min-width:320px" placeholder='Try: security OR compliance OR "AI agent"'/>
+      <button onclick="search()">Search</button>
+    </div>
+    <div id="searchStatus" class="muted" style="margin-top:8px"></div>
+    <div id="results" class="results" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h3>3) Inspect / Summarize / Export</h3>
+    <div class="row">
+      <input id="docId" style="width:160px" placeholder="doc id"/>
+      <button onclick="inspect()">Inspect</button>
+      <button onclick="summarize()">Summarize (Ollama)</button>
+      <button onclick="exportZip()">Export ZIP</button>
+    </div>
+    <div id="docOut" style="margin-top:10px"></div>
+  </div>
+
+<script>
+async function ingest(){
+  const url = document.getElementById('url').value.trim();
+  const el = document.getElementById('ingestStatus');
+  el.textContent = 'Queuing…';
+  const r = await fetch('/api/ingest', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
+  const j = await r.json();
+  if(!r.ok){ el.textContent = 'Error: ' + (j.detail || r.status); return; }
+  el.textContent = 'Queued doc id: ' + j.id + ' (wait a few seconds, then inspect/search)';
+}
+async function search(){
+  const q = document.getElementById('q').value.trim();
+  const el = document.getElementById('searchStatus');
+  const out = document.getElementById('results');
+  out.innerHTML = '';
+  el.textContent = 'Searching…';
+  const r = await fetch('/api/search?q=' + encodeURIComponent(q));
+  const j = await r.json();
+  el.textContent = 'Results: ' + j.results.length;
+  for(const it of j.results){
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.innerHTML = `
+      <div><b>#${it.id}</b> <a href="${it.url}" target="_blank" rel="noreferrer">${it.url}</a></div>
+      <div class="muted">${it.fetched_at} | status: ${it.http_status ?? '…'}</div>
+      <div><b>${escapeHtml(it.title)}</b></div>
+      <div>${escapeHtml(it.snippet)}</div>
+    `;
+    out.appendChild(d);
+  }
+}
+async function inspect(){
+  const id = document.getElementById('docId').value.trim();
+  const out = document.getElementById('docOut');
+  out.innerHTML = 'Loading…';
+  const r = await fetch('/api/docs/' + encodeURIComponent(id));
+  const j = await r.json();
+  if(!r.ok){ out.innerHTML = 'Error: ' + (j.detail || r.status); return; }
+  out.innerHTML = `
+    <div class="card">
+      <div><b>URL:</b> <a href="${j.url}" target="_blank" rel="noreferrer">${j.url}</a></div>
+      <div class="muted"><b>Fetched:</b> ${j.fetched_at} | <b>Status:</b> ${j.http_status ?? '…'} | <b>CT:</b> ${escapeHtml(j.content_type || '')}</div>
+      <div class="muted"><b>Text:</b> ${j.text_size} bytes | <b>Raw:</b> ${j.raw_size} bytes</div>
+      <details style="margin-top:10px"><summary>Text</summary><pre>${escapeHtml(j.text || '')}</pre></details>
+      <details style="margin-top:10px"><summary>Summary</summary><pre>${escapeHtml(j.summary || '')}</pre></details>
+    </div>
+  `;
+}
+async function summarize(){
+  const id = document.getElementById('docId').value.trim();
+  const out = document.getElementById('docOut');
+  const r = await fetch('/api/summarize/' + encodeURIComponent(id), {method:'POST'});
+  const j = await r.json();
+  if(!r.ok){ out.innerHTML = 'Error: ' + (j.detail || r.status); return; }
+  out.innerHTML = 'Queued summary for doc ' + j.id + '. Wait ~10-60s then Inspect again.';
+}
+function exportZip(){
+  const id = document.getElementById('docId').value.trim();
+  window.location = '/api/export/' + encodeURIComponent(id);
+}
+function escapeHtml(s){
+  return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#039;");
+}
+</script>
+</body>
+</html>
+HTML
+
+cat > "$APP_DIR/app/__init__.py" <<'PY'
+PY
+
+echo
+echo "✅ Created: $APP_DIR"
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo "Open:"
+echo "  http://localhost:${HOST_PORT}"
+echo
+echo "Optional Ollama env:"
+echo "  OLLAMA_BASE_URL=${OLLAMA_BASE_URL}"
+echo "  OLLAMA_MODEL=${OLLAMA_MODEL}"
