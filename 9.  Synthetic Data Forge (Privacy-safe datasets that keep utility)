@@ -1,0 +1,750 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# 9) SynthForge — Synthetic Data Forge (SDV + SDMetrics + Constraints + Artifacts)
+# ==============================================================================
+# Run:
+#   cd synthforge && docker compose up --build
+#
+# Open UI:
+#   http://localhost:9056
+#
+# What you can do:
+#   - Upload a CSV
+#   - Choose model: gaussian_copula / ctgan / tvae / copulagan
+#   - Set number of synthetic rows
+#   - Add constraints:
+#       * UniqueCombinations columns: "colA,colB"
+#       * Range constraints JSON: {"age":[0,120],"income":[0,1000000]}
+#   - Wait for SUCCEEDED
+#   - Download artifact bundle (synthetic.csv + report.json + logs.txt)
+#
+# Notes:
+#   - SDV handles tabular synthetic generation (copula + neural models).
+#   - SDMetrics generates quality reports and supports privacy metrics; here we add
+#     pragmatic disclosure-style checks too (replicated uniques / exact match rate).
+# ==============================================================================
+
+APP_DIR="synthforge"
+PORT="9056"
+
+# MinIO creds (local dev defaults; change if you want)
+MINIO_ROOT_USER="synthforge"
+MINIO_ROOT_PASSWORD="synthforge12345678"
+MINIO_BUCKET="synthforge-artifacts"
+
+mkdir -p "$APP_DIR"/{app/synthforge,app/synthforge/templates,app/synthforge/static,data/{uploads,work,artifacts,minio}}
+
+cat > "$APP_DIR/README.md" <<MD
+# SynthForge — Synthetic Data Forge (local-first)
+
+## Start
+\`\`\`bash
+cd synthforge
+docker compose up --build
+\`\`\`
+
+Open UI:
+- http://localhost:${PORT}
+
+## Flow
+1) Upload CSV
+2) Pick model + row count
+3) Optional constraints:
+   - Unique columns: \`user_id\` or \`user_id,email\`
+   - Range JSON: \`{"age":[0,120],"income":[0,1000000]}\`
+4) Submit job
+5) Download artifact when job is **SUCCEEDED**
+
+## Artifacts (inside bundle)
+- \`synthetic.csv\`
+- \`report.json\` (quality score + per-metric breakdown + privacy checks)
+- \`build_logs.txt\`
+
+## Local storage (host)
+- uploads:  ./data/uploads
+- workdir:   ./data/work
+- minio:     ./data/minio
+MD
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./data/minio:/data
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    environment:
+      SF_DB: /data/synthforge.sqlite3
+      SF_UPLOADS: /data/uploads
+      SF_WORK: /data/work
+      SF_ARTIFACTS: /data/artifacts
+      SF_REDIS_URL: redis://redis:6379/0
+      SF_MINIO_ENDPOINT: http://minio:9000
+      SF_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      SF_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      SF_MINIO_BUCKET: ${MINIO_BUCKET}
+    volumes:
+      - ./data:/data
+    ports:
+      - "${PORT}:8000"
+    depends_on:
+      - redis
+      - minio
+    restart: unless-stopped
+
+  worker:
+    build: ./app
+    command: ["python", "-m", "synthforge.worker"]
+    environment:
+      SF_DB: /data/synthforge.sqlite3
+      SF_UPLOADS: /data/uploads
+      SF_WORK: /data/work
+      SF_ARTIFACTS: /data/artifacts
+      SF_REDIS_URL: redis://redis:6379/0
+      SF_MINIO_ENDPOINT: http://minio:9000
+      SF_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      SF_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      SF_MINIO_BUCKET: ${MINIO_BUCKET}
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+      - minio
+    restart: unless-stopped
+EOF
+
+cat > "$APP_DIR/app/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /srv
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl tar gzip && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY synthforge ./synthforge
+
+EXPOSE 8000
+CMD ["uvicorn", "synthforge.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/app/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17
+jinja2==3.1.5
+
+rq==2.1.0
+redis==5.2.1
+minio==7.2.15
+
+pandas==2.2.3
+numpy==2.1.3
+
+sdv==1.9.0
+sdmetrics==0.12.1
+REQ
+
+cat > "$APP_DIR/app/synthforge/__init__.py" <<'PY'
+PY
+
+cat > "$APP_DIR/app/synthforge/util.py" <<'PY'
+import os, json, sqlite3, tarfile, hashlib
+from pathlib import Path
+from datetime import datetime, timezone
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def jdump(x) -> str:
+    return json.dumps(x, ensure_ascii=False, indent=2)
+
+def safe_json(s: str):
+    s = (s or "").strip()
+    if not s:
+        return None
+    return json.loads(s)
+PY
+
+cat > "$APP_DIR/app/synthforge/config.py" <<'PY'
+import os
+from pathlib import Path
+
+DB = Path(os.getenv("SF_DB", "/data/synthforge.sqlite3")).resolve()
+UPLOADS = Path(os.getenv("SF_UPLOADS", "/data/uploads")).resolve()
+WORK = Path(os.getenv("SF_WORK", "/data/work")).resolve()
+ARTIFACTS = Path(os.getenv("SF_ARTIFACTS", "/data/artifacts")).resolve()
+
+REDIS_URL = os.getenv("SF_REDIS_URL", "redis://localhost:6379/0")
+
+MINIO_ENDPOINT = os.getenv("SF_MINIO_ENDPOINT", "http://localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("SF_MINIO_ACCESS_KEY", "synthforge")
+MINIO_SECRET_KEY = os.getenv("SF_MINIO_SECRET_KEY", "synthforge12345678")
+MINIO_BUCKET = os.getenv("SF_MINIO_BUCKET", "synthforge-artifacts")
+PY
+
+cat > "$APP_DIR/app/synthforge/db.py" <<'PY'
+import sqlite3
+from .config import DB
+
+def connect():
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
+    return c
+
+def init_db():
+    with connect() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          status TEXT NOT NULL,          -- QUEUED/RUNNING/SUCCEEDED/FAILED
+          filename TEXT NOT NULL,        -- uploaded csv file basename
+          model TEXT NOT NULL,           -- gaussian_copula/ctgan/tvae/copulagan
+          rows INTEGER NOT NULL,
+          unique_cols TEXT NOT NULL,     -- comma list
+          ranges_json TEXT NOT NULL,     -- json string
+          logs TEXT NOT NULL,
+          artifact_key TEXT,
+          artifact_sha256 TEXT
+        );
+        """)
+PY
+
+cat > "$APP_DIR/app/synthforge/minio_client.py" <<'PY'
+from minio import Minio
+from minio.error import S3Error
+from .config import MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET
+
+def client() -> Minio:
+    endpoint = MINIO_ENDPOINT.replace("http://","").replace("https://","")
+    secure = MINIO_ENDPOINT.startswith("https://")
+    return Minio(endpoint, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=secure)
+
+def ensure_bucket():
+    mc = client()
+    if not mc.bucket_exists(MINIO_BUCKET):
+        mc.make_bucket(MINIO_BUCKET)
+
+def put_file(object_name: str, file_path: str, content_type: str="application/gzip"):
+    mc = client()
+    ensure_bucket()
+    mc.fput_object(MINIO_BUCKET, object_name, file_path, content_type=content_type)
+
+def presign_get(object_name: str, expiry_seconds: int=3600):
+    mc = client()
+    ensure_bucket()
+    return mc.presigned_get_object(MINIO_BUCKET, object_name, expires=expiry_seconds)
+PY
+
+cat > "$APP_DIR/app/synthforge/jobs.py" <<'PY'
+from __future__ import annotations
+import json
+from redis import Redis
+from rq import Queue
+from .config import REDIS_URL
+from .db import connect
+from .util import now_iso
+
+def q() -> Queue:
+    r = Redis.from_url(REDIS_URL)
+    return Queue("synthforge", connection=r)
+
+def create_job(job_id: str, filename: str, model: str, rows: int, unique_cols: str, ranges_json: str):
+    with connect() as c:
+        c.execute(
+            "INSERT INTO jobs(id, created_at, status, filename, model, rows, unique_cols, ranges_json, logs) VALUES (?,?,?,?,?,?,?,?,?)",
+            (job_id, now_iso(), "QUEUED", filename, model, int(rows), unique_cols, ranges_json, ""),
+        )
+
+def update_job(job_id: str, **fields):
+    if not fields:
+        return
+    cols = []
+    vals = []
+    for k,v in fields.items():
+        cols.append(f"{k}=?")
+        vals.append(v)
+    vals.append(job_id)
+    with connect() as c:
+        c.execute(f"UPDATE jobs SET {', '.join(cols)} WHERE id=?", tuple(vals))
+
+def get_job(job_id: str):
+    with connect() as c:
+        r = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return dict(r) if r else None
+
+def list_jobs(limit: int=50):
+    with connect() as c:
+        rows = c.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(x) for x in rows]
+PY
+
+cat > "$APP_DIR/app/synthforge/engine.py" <<'PY'
+from __future__ import annotations
+import json
+import numpy as np
+import pandas as pd
+
+from sdv.metadata import SingleTableMetadata
+from sdv.single_table import GaussianCopulaSynthesizer, CTGANSynthesizer, TVAESynthesizer, CopulaGANSynthesizer
+
+# constraints
+from sdv.constraints.tabular import UniqueCombinations, Range
+
+from sdmetrics.reports.single_table import QualityReport
+
+def _parse_unique_cols(s: str):
+    cols = [c.strip() for c in (s or "").split(",") if c.strip()]
+    return cols
+
+def _parse_ranges_json(s: str):
+    s = (s or "").strip()
+    if not s:
+        return {}
+    obj = json.loads(s)
+    if not isinstance(obj, dict):
+        raise ValueError("ranges_json must be a JSON object mapping col -> [min,max]")
+    out = {}
+    for k,v in obj.items():
+        if not (isinstance(v, list) and len(v) == 2):
+            raise ValueError(f"range for {k} must be [min,max]")
+        out[str(k)] = (v[0], v[1])
+    return out
+
+def make_synth(model: str, metadata: SingleTableMetadata):
+    m = (model or "").strip().lower()
+    if m == "gaussian_copula":
+        return GaussianCopulaSynthesizer(metadata)
+    if m == "ctgan":
+        return CTGANSynthesizer(metadata)
+    if m == "tvae":
+        return TVAESynthesizer(metadata)
+    if m == "copulagan":
+        return CopulaGANSynthesizer(metadata)
+    raise ValueError("model must be one of: gaussian_copula, ctgan, tvae, copulagan")
+
+def privacy_checks(real: pd.DataFrame, synth: pd.DataFrame, quasi_cols: list[str]) -> dict:
+    # Pragmatic disclosure-style checks:
+    # - replicated uniques (count of unique quasi-identifier combos in real that appear in synth)
+    # - exact match rate on quasi-identifier combos
+    res = {"quasi_cols": quasi_cols, "replicated_uniques": None, "exact_match_rate": None}
+    if not quasi_cols:
+        return res
+
+    rr = real.dropna(subset=quasi_cols).copy()
+    ss = synth.dropna(subset=quasi_cols).copy()
+
+    if rr.empty or ss.empty:
+        return res
+
+    rkeys = rr[quasi_cols].astype(str).agg("||".join, axis=1)
+    skeys = ss[quasi_cols].astype(str).agg("||".join, axis=1)
+
+    r_counts = rkeys.value_counts()
+    r_unique_keys = set(r_counts[r_counts == 1].index)
+
+    s_keyset = set(skeys.values)
+
+    replicated_uniques = len(r_unique_keys.intersection(s_keyset))
+    exact_match_rate = float(np.mean(rkeys.isin(s_keyset)))
+
+    res["replicated_uniques"] = int(replicated_uniques)
+    res["exact_match_rate"] = float(round(exact_match_rate, 6))
+    return res
+
+def run_synth(
+    csv_path: str,
+    model: str,
+    rows: int,
+    unique_cols_csv: str,
+    ranges_json: str,
+) -> tuple[pd.DataFrame, dict]:
+    real = pd.read_csv(csv_path)
+
+    # metadata detection
+    md = SingleTableMetadata()
+    md.detect_from_dataframe(real)
+
+    synth = make_synth(model, md)
+
+    # constraints
+    constraints = []
+    ucols = _parse_unique_cols(unique_cols_csv)
+    if ucols:
+        constraints.append(UniqueCombinations(columns=ucols))
+
+    ranges = _parse_ranges_json(ranges_json)
+    for col, (mn, mx) in ranges.items():
+        constraints.append(Range(column=col, low_value=mn, high_value=mx))
+
+    if constraints:
+        synth.add_constraints(constraints)
+
+    synth.fit(real)
+    synthetic = synth.sample(num_rows=int(rows))
+
+    # quality report
+    q = QualityReport()
+    q.generate(real_data=real, synthetic_data=synthetic, metadata=md)
+
+    quality_score = float(q.get_score())
+    details = q.get_details(property_name="Column Shapes").to_dict(orient="records") if hasattr(q, "get_details") else []
+
+    # privacy checks (user-provided unique_cols used as quasi identifiers by default)
+    privacy = privacy_checks(real, synthetic, ucols)
+
+    report = {
+        "model": model,
+        "rows": int(rows),
+        "quality_score": float(round(quality_score, 6)),
+        "quality_details_column_shapes": details,
+        "privacy_checks": privacy,
+    }
+    return synthetic, report
+PY
+
+cat > "$APP_DIR/app/synthforge/worker.py" <<'PY'
+from __future__ import annotations
+import uuid, tarfile
+from pathlib import Path
+
+from rq import Worker
+from redis import Redis
+
+from .config import REDIS_URL, UPLOADS, WORK, ARTIFACTS
+from .jobs import get_job, update_job
+from .util import ensure_dir, sha256_file, jdump
+from .engine import run_synth
+from .minio_client import put_file
+
+def process_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return
+
+    update_job(job_id, status="RUNNING")
+    logs = []
+    def log(s): logs.append(s if s.endswith("\n") else s+"\n")
+
+    try:
+        ensure_dir(UPLOADS); ensure_dir(WORK); ensure_dir(ARTIFACTS)
+
+        csv_name = job["filename"]
+        csv_path = (UPLOADS / csv_name).resolve()
+        if not csv_path.exists():
+            raise RuntimeError(f"missing upload: {csv_path}")
+
+        model = job["model"]
+        rows = int(job["rows"])
+        unique_cols = job["unique_cols"]
+        ranges_json = job["ranges_json"]
+
+        log(f"[synthforge] job={job_id}")
+        log(f"[synthforge] input={csv_name}")
+        log(f"[synthforge] model={model} rows={rows}")
+        log(f"[synthforge] unique_cols={unique_cols}")
+        log(f"[synthforge] ranges_json={ranges_json}")
+
+        syn_df, report = run_synth(
+            csv_path=str(csv_path),
+            model=model,
+            rows=rows,
+            unique_cols_csv=unique_cols,
+            ranges_json=ranges_json,
+        )
+
+        out_dir = WORK / job_id
+        ensure_dir(out_dir)
+
+        syn_path = out_dir / "synthetic.csv"
+        rep_path = out_dir / "report.json"
+        log_path = out_dir / "build_logs.txt"
+
+        syn_df.to_csv(syn_path, index=False)
+        rep_path.write_text(jdump(report), encoding="utf-8")
+        log_path.write_text("".join(logs), encoding="utf-8")
+
+        # bundle
+        tar_path = ARTIFACTS / f"{job_id}.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tf:
+            tf.add(str(syn_path), arcname="synthetic.csv")
+            tf.add(str(rep_path), arcname="report.json")
+            tf.add(str(log_path), arcname="build_logs.txt")
+
+        digest = sha256_file(tar_path)
+        object_key = f"{job_id}/artifact.tar.gz"
+        put_file(object_key, str(tar_path), content_type="application/gzip")
+
+        update_job(
+            job_id,
+            status="SUCCEEDED",
+            logs="".join(logs),
+            artifact_key=object_key,
+            artifact_sha256=digest,
+        )
+
+    except Exception as e:
+        log(f"[synthforge][ERROR] {e}")
+        update_job(job_id, status="FAILED", logs="".join(logs))
+
+def main():
+    r = Redis.from_url(REDIS_URL)
+    w = Worker(["synthforge"], connection=r)
+    w.work(with_scheduler=False)
+
+if __name__ == "__main__":
+    main()
+PY
+
+cat > "$APP_DIR/app/synthforge/web.py" <<'PY'
+from __future__ import annotations
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Request, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+
+from .config import UPLOADS
+from .jobs import q, create_job, list_jobs, get_job
+from .worker import process_job
+from .minio_client import presign_get
+
+BASE = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE / "templates"))
+router = APIRouter()
+
+@router.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    jobs = list_jobs(100)
+    return templates.TemplateResponse("index.html", {"request": request, "jobs": jobs})
+
+@router.post("/create")
+async def create(
+    csvfile: UploadFile = File(...),
+    model: str = Form(...),
+    rows: int = Form(...),
+    unique_cols: str = Form(""),
+    ranges_json: str = Form(""),
+):
+    job_id = uuid.uuid4().hex
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+
+    safe_name = f"{job_id}__{Path(csvfile.filename).name}"
+    dst = (UPLOADS / safe_name).resolve()
+    content = await csvfile.read()
+    dst.write_bytes(content)
+
+    create_job(
+        job_id=job_id,
+        filename=safe_name,
+        model=model.strip(),
+        rows=int(rows),
+        unique_cols=(unique_cols or "").strip(),
+        ranges_json=(ranges_json or "").strip(),
+    )
+
+    q().enqueue(process_job, job_id, job_id=job_id)
+    return RedirectResponse(url=f"/job/{job_id}", status_code=303)
+
+@router.get("/job/{job_id}", response_class=HTMLResponse)
+def job_page(request: Request, job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return HTMLResponse("Not found", status_code=404)
+
+    dl = None
+    if job.get("artifact_key") and job.get("status") == "SUCCEEDED":
+        dl = presign_get(job["artifact_key"], expiry_seconds=3600)
+
+    return templates.TemplateResponse("job.html", {"request": request, "job": job, "download_url": dl})
+PY
+
+cat > "$APP_DIR/app/synthforge/main.py" <<'PY'
+from fastapi import FastAPI
+from .db import init_db
+from .web import router
+
+init_db()
+app = FastAPI(title="SynthForge")
+app.include_router(router)
+PY
+
+cat > "$APP_DIR/app/synthforge/templates/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SynthForge</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    input,select,button,textarea{font-size:14px;padding:10px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;margin-top:14px}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #ddd;border-radius:999px;font-size:12px}
+    a{color:inherit}
+    textarea{width:100%;min-height:90px;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
+  </style>
+</head>
+<body>
+  <h1>SynthForge</h1>
+  <p>Upload CSV → SDV synth → SDMetrics quality report → privacy checks → artifact bundle.</p>
+
+  <div class="card">
+    <h3>Create job</h3>
+    <form method="post" action="/create" enctype="multipart/form-data">
+      <div style="margin-bottom:10px">
+        <input type="file" name="csvfile" accept=".csv" required>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <label>Model:</label>
+        <select name="model">
+          <option value="gaussian_copula">gaussian_copula</option>
+          <option value="ctgan">ctgan</option>
+          <option value="tvae">tvae</option>
+          <option value="copulagan">copulagan</option>
+        </select>
+
+        <label>Rows:</label>
+        <input name="rows" type="number" min="1" value="1000" required style="width:140px">
+      </div>
+
+      <div style="margin-bottom:10px">
+        <label><b>Unique columns</b> (comma list; also used as quasi-identifiers for privacy checks):</label>
+        <input name="unique_cols" placeholder="e.g. user_id,email" style="width:100%">
+      </div>
+
+      <div style="margin-bottom:10px">
+        <label><b>Range constraints JSON</b> (col -> [min,max]):</label>
+        <textarea name="ranges_json" placeholder='{"age":[0,120],"income":[0,1000000]}'></textarea>
+      </div>
+
+      <button type="submit">Forge synthetic data</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Jobs</h3>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Input</th><th>Model</th><th>Rows</th><th>Status</th><th>Created</th></tr>
+      </thead>
+      <tbody>
+        {% for j in jobs %}
+          <tr>
+            <td><a href="/job/{{j.id}}">{{j.id[:10]}}…</a></td>
+            <td>{{j.filename}}</td>
+            <td>{{j.model}}</td>
+            <td>{{j.rows}}</td>
+            <td><span class="pill">{{j.status}}</span></td>
+            <td>{{j.created_at}}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+HTML
+
+cat > "$APP_DIR/app/synthforge/templates/job.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SynthForge Job</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;margin-top:14px}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:12px;border-radius:12px}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #ddd;border-radius:999px;font-size:12px}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <a href="/">← back</a>
+  <h1>Job {{job.id}}</h1>
+
+  <div class="card">
+    <div><b>Status:</b> <span class="pill">{{job.status}}</span></div>
+    <div><b>Input:</b> {{job.filename}}</div>
+    <div><b>Model:</b> {{job.model}}</div>
+    <div><b>Rows:</b> {{job.rows}}</div>
+    <div><b>Unique cols:</b> {{job.unique_cols}}</div>
+    <div><b>Ranges:</b> {{job.ranges_json}}</div>
+
+    {% if job.artifact_sha256 %}
+      <div><b>Artifact sha256:</b> {{job.artifact_sha256}}</div>
+    {% endif %}
+
+    {% if download_url %}
+      <div style="margin-top:10px"><b>Download artifact (1h link):</b> <a href="{{download_url}}">download</a></div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>Logs</h3>
+    <pre>{{job.logs}}</pre>
+  </div>
+
+  <script>
+    const st = "{{job.status}}";
+    if(st === "QUEUED" || st === "RUNNING"){
+      setTimeout(()=>location.reload(), 1500);
+    }
+  </script>
+</body>
+</html>
+HTML
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Open UI:"
+echo "  http://localhost:${PORT}"
+echo
+echo "MinIO Console:"
+echo "  http://localhost:9011  (S3: http://localhost:9010)"
+echo "  user=${MINIO_ROOT_USER}"
