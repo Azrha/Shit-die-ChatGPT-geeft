@@ -1,0 +1,961 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# 7) RiskLedger — Personal ISO/NIS2 Compliance OS (local-first, audit-grade)
+# ==============================================================================
+# NAAM
+#   RiskLedger
+#
+# WAT HET DOET
+#   - Beheert risico’s als ledger-entries (met impact/likelihood + tijdlijn)
+#   - Koppelt controls aan risico’s + meet control health (assessments + evidence freshness)
+#   - Berekent continu risk score: inherent risk -> residual risk op basis van control coverage
+#   - Bewaart bewijs (uploads) + bewaart assessments (PASS/PARTIAL/FAIL) met timestamps
+#   - Exporteert audit packs (JSON + Markdown) en biedt UI + API
+#
+# WAAROM HET NODIG IS
+#   - Checklists zijn statisch; audits vragen traceerbaarheid, bewijs en verandering door tijd.
+#   - RiskLedger maakt “continuous compliance” tastbaar: als een control faalt/veroudert -> risico stijgt.
+#
+# GEBRUIK (kort)
+#   1) Run:  cd riskledger && docker compose up --build
+#   2) Open UI: http://localhost:8944
+#   3) Voeg risico’s/controls toe, link ze, upload evidence, maak assessments
+#   4) Bekijk dashboard (residual risk live) + export audit pack per snapshot
+# ==============================================================================
+
+APP_DIR="riskledger"
+PORT="8944"
+
+mkdir -p "$APP_DIR"/{app/riskledger,app/riskledger/templates,app/riskledger/static,app/riskledger/uploads,data}
+
+cat > "$APP_DIR/README.md" <<'MD'
+# RiskLedger — Personal ISO/NIS2 Compliance OS (local-first)
+
+## Start
+    cd riskledger
+    docker compose up --build
+
+Open UI:
+    http://localhost:8944
+
+## Core workflow (5 minuten)
+1) Add a risk (impact 1–5, likelihood 1–5)
+2) Add a control (effectiveness 1–5, target review days)
+3) Link control -> risk
+4) Upload evidence to a control (file + note)
+5) Record an assessment for a control (PASS / PARTIAL / FAIL)
+6) Check dashboard: residual risk updates instantly
+
+## Export audit pack
+- UI: open a risk and click Export
+- API:
+    GET /api/export/audit-pack?snapshot=latest
+
+The audit pack contains:
+- Controls + latest assessments + evidence list
+- Risks + inherent + residual + “why” breakdown
+- Ledger events (what changed and when)
+
+## Notes
+- No cloud calls.
+- SQLite storage in ./data
+MD
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  riskledger:
+    build: ./app
+    environment:
+      - RL_DB=/data/riskledger.sqlite3
+      - RL_UPLOAD_DIR=/srv/riskledger/uploads
+      - RL_PORT=8000
+      - RL_EVIDENCE_FRESH_DAYS_DEFAULT=30
+    volumes:
+      - ./data:/data
+      - ./app/riskledger/uploads:/srv/riskledger/uploads
+    ports:
+      - "${PORT}:8000"
+EOF
+
+cat > "$APP_DIR/app/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /srv
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY riskledger ./riskledger
+
+EXPOSE 8000
+CMD ["uvicorn", "riskledger.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/app/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+jinja2==3.1.5
+REQ
+
+cat > "$APP_DIR/app/riskledger/__init__.py" <<'PY'
+PY
+
+cat > "$APP_DIR/app/riskledger/util.py" <<'PY'
+import json
+import uuid
+from datetime import datetime, timezone
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def uid() -> str:
+    return uuid.uuid4().hex
+
+def jdump(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=False)
+
+def jloads(s: str):
+    return json.loads(s)
+PY
+
+cat > "$APP_DIR/app/riskledger/db.py" <<'PY'
+import os
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(os.getenv("RL_DB", "/data/riskledger.sqlite3")).resolve()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def connect() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
+    return c
+
+def init_db() -> None:
+    with connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS ledger_events (
+              id TEXT PRIMARY KEY,
+              ts TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              ref_type TEXT NOT NULL,
+              ref_id TEXT NOT NULL,
+              message TEXT NOT NULL,
+              payload_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS risks (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              title TEXT NOT NULL,
+              description TEXT NOT NULL,
+              category TEXT NOT NULL,
+              impact INTEGER NOT NULL,        -- 1..5
+              likelihood INTEGER NOT NULL,    -- 1..5
+              owner TEXT NOT NULL,
+              status TEXT NOT NULL            -- OPEN/MITIGATING/ACCEPTED/CLOSED
+            );
+
+            CREATE TABLE IF NOT EXISTS controls (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              code TEXT NOT NULL,             -- e.g. A.5.1 or NIS2-M1
+              framework TEXT NOT NULL,        -- ISO27001 / NIS2 / CUSTOM
+              title TEXT NOT NULL,
+              description TEXT NOT NULL,
+              effectiveness INTEGER NOT NULL, -- 1..5
+              review_days INTEGER NOT NULL    -- target freshness window
+            );
+
+            CREATE TABLE IF NOT EXISTS risk_control_links (
+              risk_id TEXT NOT NULL,
+              control_id TEXT NOT NULL,
+              coverage_weight REAL NOT NULL DEFAULT 1.0,
+              PRIMARY KEY (risk_id, control_id),
+              FOREIGN KEY (risk_id) REFERENCES risks(id) ON DELETE CASCADE,
+              FOREIGN KEY (control_id) REFERENCES controls(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS evidence (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              control_id TEXT NOT NULL,
+              filename TEXT NOT NULL,
+              stored_path TEXT NOT NULL,
+              note TEXT NOT NULL,
+              sha256 TEXT NOT NULL,
+              FOREIGN KEY (control_id) REFERENCES controls(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS assessments (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              control_id TEXT NOT NULL,
+              result TEXT NOT NULL,           -- PASS/PARTIAL/FAIL
+              confidence INTEGER NOT NULL,     -- 1..10
+              assessor TEXT NOT NULL,
+              notes TEXT NOT NULL,
+              FOREIGN KEY (control_id) REFERENCES controls(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON ledger_events(ts);
+            CREATE INDEX IF NOT EXISTS idx_evidence_control ON evidence(control_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_assess_control ON assessments(control_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_controls_code ON controls(code);
+            """
+        )
+PY
+
+cat > "$APP_DIR/app/riskledger/scoring.py" <<'PY'
+from __future__ import annotations
+from datetime import datetime, timezone
+from typing import Optional
+
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+def parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z","+00:00"))
+
+def days_since(ts: str, now: Optional[datetime]=None) -> float:
+    now = now or datetime.now(timezone.utc)
+    dt = parse_iso(ts)
+    return max(0.0, (now - dt).total_seconds() / 86400.0)
+
+def inherent_risk(impact: int, likelihood: int) -> float:
+    # Simple, explicit, explainable: 1..25
+    return float(impact * likelihood)
+
+def assessment_factor(result: str) -> float:
+    # PASS => 1.0, PARTIAL => 0.6, FAIL => 0.0
+    r = (result or "").upper()
+    if r == "PASS":
+        return 1.0
+    if r == "PARTIAL":
+        return 0.6
+    return 0.0
+
+def freshness_factor(evidence_age_days: float, review_days: int) -> float:
+    # Evidence decays linearly after review window; never below 0.
+    # If within window: 1.0; at 2x window: 0.0
+    w = max(1, int(review_days))
+    if evidence_age_days <= w:
+        return 1.0
+    if evidence_age_days >= 2*w:
+        return 0.0
+    return clamp(1.0 - ((evidence_age_days - w) / w), 0.0, 1.0)
+
+def control_health(effectiveness: int, assess_factor: float, fresh_factor: float) -> float:
+    # effectiveness 1..5 => 0.2..1.0
+    eff = clamp(effectiveness / 5.0, 0.0, 1.0)
+    return clamp(eff * assess_factor * fresh_factor, 0.0, 1.0)
+
+def residual_risk(inherent: float, coverage: float) -> float:
+    # residual = inherent * (1 - coverage)
+    return clamp(inherent * (1.0 - clamp(coverage, 0.0, 1.0)), 0.0, inherent)
+
+def explain_residual(inherent: float, controls: list[dict]) -> dict:
+    # Weighted average coverage across linked controls
+    total_w = sum(float(c.get("weight",1.0)) for c in controls) or 1.0
+    cov = 0.0
+    per = []
+    for c in controls:
+        w = float(c.get("weight",1.0))
+        h = float(c.get("health",0.0))
+        cov += (w/total_w) * h
+        per.append({
+            "code": c.get("code"),
+            "health": round(h, 4),
+            "weight": round(w, 4),
+            "contribution": round((w/total_w)*h, 4),
+            "why": c.get("why", {}),
+        })
+    res = residual_risk(inherent, cov)
+    return {
+        "inherent": round(inherent, 4),
+        "coverage": round(cov, 4),
+        "residual": round(res, 4),
+        "controls": per,
+    }
+PY
+
+cat > "$APP_DIR/app/riskledger/catalog.py" <<'PY'
+# Built-in minimal catalogs (useful out-of-the-box, still fully functional).
+# ISO 27001 control texts are copyrighted; we do NOT embed Annex A text here.
+# Instead, we provide a practical starting set + NIS2-minimum-measures-style entries (paraphrased).
+
+BUILTIN_CONTROLS = [
+  # NIS2-style minimum measures (paraphrased as practical controls)
+  {"code":"NIS2-M1","framework":"NIS2","title":"Risk analysis & security policies",
+   "description":"Maintain documented cyber risk analysis and security policies; review periodically."},
+  {"code":"NIS2-M2","framework":"NIS2","title":"Incident handling",
+   "description":"Maintain incident response process, triage, containment, eradication, lessons learned."},
+  {"code":"NIS2-M3","framework":"NIS2","title":"Business continuity & crisis management",
+   "description":"BCP/DR, backups, restore testing, crisis comms, recovery objectives."},
+  {"code":"NIS2-M4","framework":"NIS2","title":"Supply chain security",
+   "description":"Assess supplier risk, require security clauses, monitor critical vendors."},
+  {"code":"NIS2-M5","framework":"NIS2","title":"Secure development & vulnerability handling",
+   "description":"Secure SDLC, patch/vuln management, coordinated disclosure, remediation SLAs."},
+  {"code":"NIS2-M6","framework":"NIS2","title":"Effectiveness testing",
+   "description":"Test measures; exercises, audits, pentests where relevant; track remediation."},
+  {"code":"NIS2-M7","framework":"NIS2","title":"Security awareness & training",
+   "description":"Role-based training; management oversight; periodic refresh; phishing drills if applicable."},
+  {"code":"NIS2-M8","framework":"NIS2","title":"Access control & asset management",
+   "description":"Least privilege, MFA where appropriate, asset inventory, lifecycle and ownership."},
+  {"code":"NIS2-M9","framework":"NIS2","title":"Cryptography where appropriate",
+   "description":"Protect data in transit/at rest; manage keys; define crypto standards."},
+  {"code":"NIS2-M10","framework":"NIS2","title":"Logging, monitoring and detection",
+   "description":"Log critical events, monitor, alert, retain; ensure integrity and review."},
+
+  # Practical ISO-aligned examples (custom-coded; user can replace with their catalog)
+  {"code":"ISO-ORG-SEC-GOV","framework":"ISO27001","title":"Security governance & ownership",
+   "description":"Define security roles/responsibilities; maintain ISMS scope and accountability."},
+  {"code":"ISO-TECH-ACCESS","framework":"ISO27001","title":"Access management",
+   "description":"Provision/deprovision, privilege reviews, MFA, joiner/mover/leaver controls."},
+  {"code":"ISO-TECH-BACKUP","framework":"ISO27001","title":"Backups & restore testing",
+   "description":"Backups with regular restore tests, RPO/RTO targets, immutable copies if needed."},
+  {"code":"ISO-TECH-LOGGING","framework":"ISO27001","title":"Logging and monitoring",
+   "description":"Central logging, alerting, retention, and periodic review for key systems."},
+]
+PY
+
+cat > "$APP_DIR/app/riskledger/service.py" <<'PY'
+import os
+import hashlib
+from pathlib import Path
+from .db import connect
+from .util import now_iso, uid, jdump
+from .scoring import (
+    inherent_risk, assessment_factor, freshness_factor, control_health, days_since, explain_residual
+)
+
+UPLOAD_DIR = Path(os.getenv("RL_UPLOAD_DIR", "/srv/riskledger/uploads")).resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+def log_event(kind: str, ref_type: str, ref_id: str, message: str, payload: dict):
+    with connect() as c:
+        c.execute(
+            "INSERT INTO ledger_events(id, ts, kind, ref_type, ref_id, message, payload_json) VALUES (?,?,?,?,?,?,?)",
+            (uid(), now_iso(), kind, ref_type, ref_id, message, jdump(payload)),
+        )
+
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def create_risk(title, description, category, impact, likelihood, owner, status="OPEN"):
+    rid = uid()
+    with connect() as c:
+        c.execute(
+            "INSERT INTO risks(id, created_at, title, description, category, impact, likelihood, owner, status) VALUES (?,?,?,?,?,?,?,?,?)",
+            (rid, now_iso(), title, description, category, int(impact), int(likelihood), owner, status),
+        )
+    log_event("RISK_CREATED","risk",rid,"Risk created",{"title":title,"impact":impact,"likelihood":likelihood})
+    return rid
+
+def create_control(code, framework, title, description, effectiveness, review_days):
+    cid = uid()
+    with connect() as c:
+        c.execute(
+            "INSERT INTO controls(id, created_at, code, framework, title, description, effectiveness, review_days) VALUES (?,?,?,?,?,?,?,?)",
+            (cid, now_iso(), code, framework, title, description, int(effectiveness), int(review_days)),
+        )
+    log_event("CONTROL_CREATED","control",cid,"Control created",{"code":code,"framework":framework})
+    return cid
+
+def link_control(risk_id, control_id, weight=1.0):
+    with connect() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO risk_control_links(risk_id, control_id, coverage_weight) VALUES (?,?,?)",
+            (risk_id, control_id, float(weight)),
+        )
+    log_event("LINK_CREATED","risk",risk_id,"Linked control to risk",{"control_id":control_id,"weight":weight})
+
+def add_assessment(control_id, result, confidence, assessor, notes):
+    aid = uid()
+    with connect() as c:
+        c.execute(
+            "INSERT INTO assessments(id, created_at, control_id, result, confidence, assessor, notes) VALUES (?,?,?,?,?,?,?)",
+            (aid, now_iso(), control_id, result.upper(), int(confidence), assessor, notes),
+        )
+    log_event("ASSESSMENT_ADDED","control",control_id,"Assessment added",{"result":result,"confidence":confidence,"assessor":assessor})
+    return aid
+
+def add_evidence(control_id, filename, data_bytes: bytes, note: str):
+    eid = uid()
+    safe_name = f"{eid}__{filename}".replace("/","_").replace("\\","_")
+    out = UPLOAD_DIR / safe_name
+    out.write_bytes(data_bytes)
+    dig = sha256_file(out)
+    with connect() as c:
+        c.execute(
+            "INSERT INTO evidence(id, created_at, control_id, filename, stored_path, note, sha256) VALUES (?,?,?,?,?,?,?)",
+            (eid, now_iso(), control_id, filename, str(out), note, dig),
+        )
+    log_event("EVIDENCE_ADDED","control",control_id,"Evidence uploaded",{"filename":filename,"sha256":dig})
+    return eid
+
+def latest_assessment(control_id):
+    with connect() as c:
+        r = c.execute(
+            "SELECT * FROM assessments WHERE control_id=? ORDER BY created_at DESC LIMIT 1",
+            (control_id,),
+        ).fetchone()
+    return dict(r) if r else None
+
+def latest_evidence(control_id):
+    with connect() as c:
+        r = c.execute(
+            "SELECT * FROM evidence WHERE control_id=? ORDER BY created_at DESC LIMIT 1",
+            (control_id,),
+        ).fetchone()
+    return dict(r) if r else None
+
+def compute_control_health(control_row: dict):
+    cid = control_row["id"]
+    a = latest_assessment(cid)
+    e = latest_evidence(cid)
+
+    assess = assessment_factor(a["result"]) if a else 0.0
+    assess_why = {"latest_assessment": a} if a else {"latest_assessment": None, "note":"No assessment yet -> health penalized"}
+
+    if e:
+        age = days_since(e["created_at"])
+        fresh = freshness_factor(age, int(control_row["review_days"]))
+        fresh_why = {"latest_evidence": e, "evidence_age_days": round(age,3)}
+    else:
+        fresh = 0.0
+        fresh_why = {"latest_evidence": None, "note":"No evidence yet -> freshness=0"}
+
+    h = control_health(int(control_row["effectiveness"]), assess, fresh)
+    return {
+        "health": h,
+        "why": {
+            "effectiveness": int(control_row["effectiveness"]),
+            "assessment_factor": assess,
+            "assessment": assess_why,
+            "freshness_factor": fresh,
+            "freshness": fresh_why,
+        }
+    }
+
+def risk_breakdown(risk_id: str) -> dict:
+    with connect() as c:
+        r = c.execute("SELECT * FROM risks WHERE id=?", (risk_id,)).fetchone()
+        if not r:
+            raise ValueError("risk not found")
+        links = c.execute(
+            """
+            SELECT l.coverage_weight, c.*
+            FROM risk_control_links l
+            JOIN controls c ON c.id = l.control_id
+            WHERE l.risk_id=?
+            """,
+            (risk_id,),
+        ).fetchall()
+
+    inherent = inherent_risk(int(r["impact"]), int(r["likelihood"]))
+
+    controls = []
+    for row in links:
+        cr = dict(row)
+        meta = compute_control_health(cr)
+        controls.append({
+            "code": cr["code"],
+            "framework": cr["framework"],
+            "title": cr["title"],
+            "weight": float(cr["coverage_weight"]),
+            "health": float(meta["health"]),
+            "why": meta["why"],
+        })
+
+    expl = explain_residual(inherent, controls)
+    return {
+        "risk": dict(r),
+        "explain": expl,
+    }
+
+def dashboard(limit: int = 100) -> dict:
+    with connect() as c:
+        risks = c.execute("SELECT * FROM risks ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    items = []
+    for r in risks:
+        bd = risk_breakdown(r["id"])
+        items.append({
+            "id": r["id"],
+            "title": r["title"],
+            "category": r["category"],
+            "owner": r["owner"],
+            "status": r["status"],
+            "inherent": bd["explain"]["inherent"],
+            "coverage": bd["explain"]["coverage"],
+            "residual": bd["explain"]["residual"],
+        })
+    # sort by residual desc
+    items.sort(key=lambda x: x["residual"], reverse=True)
+    return {"items": items}
+
+def export_audit_pack(snapshot: str="latest") -> dict:
+    # "snapshot" is conceptual here (we export current state). The ledger_events provides history.
+    with connect() as c:
+        risks = [dict(x) for x in c.execute("SELECT * FROM risks ORDER BY created_at DESC").fetchall()]
+        controls = [dict(x) for x in c.execute("SELECT * FROM controls ORDER BY created_at DESC").fetchall()]
+        links = [dict(x) for x in c.execute("SELECT * FROM risk_control_links").fetchall()]
+        evidence = [dict(x) for x in c.execute("SELECT * FROM evidence ORDER BY created_at DESC").fetchall()]
+        assessments = [dict(x) for x in c.execute("SELECT * FROM assessments ORDER BY created_at DESC").fetchall()]
+        events = [dict(x) for x in c.execute("SELECT * FROM ledger_events ORDER BY ts DESC LIMIT 500").fetchall()]
+
+    breakdowns = []
+    for r in risks:
+        try:
+            breakdowns.append(risk_breakdown(r["id"]))
+        except Exception:
+            continue
+
+    return {
+        "snapshot": snapshot,
+        "risks": risks,
+        "controls": controls,
+        "links": links,
+        "evidence": evidence,
+        "assessments": assessments,
+        "risk_breakdowns": breakdowns,
+        "ledger_events_latest_500": events,
+    }
+PY
+
+cat > "$APP_DIR/app/riskledger/web.py" <<'PY'
+from pathlib import Path
+from fastapi import APIRouter, Request, Form, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.templating import Jinja2Templates
+
+from .db import connect
+from .util import jdump
+from .service import (
+    create_risk, create_control, link_control, add_assessment, add_evidence,
+    dashboard, risk_breakdown, export_audit_pack
+)
+
+BASE = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE / "templates"))
+router = APIRouter()
+
+@router.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    dash = dashboard(200)
+    with connect() as c:
+        risks = c.execute("SELECT id, title FROM risks ORDER BY created_at DESC").fetchall()
+        controls = c.execute("SELECT id, code, framework, title FROM controls ORDER BY created_at DESC").fetchall()
+        links = c.execute("SELECT * FROM risk_control_links").fetchall()
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "dash": dash,
+        "risks": risks,
+        "controls": controls,
+        "links": links,
+    })
+
+@router.get("/risk/{risk_id}", response_class=HTMLResponse)
+def risk_page(request: Request, risk_id: str):
+    bd = risk_breakdown(risk_id)
+    with connect() as c:
+        links = c.execute(
+            """
+            SELECT l.coverage_weight, c.id as control_id, c.code, c.framework, c.title
+            FROM risk_control_links l JOIN controls c ON c.id=l.control_id
+            WHERE l.risk_id=?
+            """,
+            (risk_id,),
+        ).fetchall()
+    return templates.TemplateResponse("risk.html", {
+        "request": request,
+        "bd": bd,
+        "links": links,
+    })
+
+@router.post("/api/risk")
+def api_add_risk(
+    title: str = Form(...),
+    description: str = Form(...),
+    category: str = Form("GENERAL"),
+    impact: int = Form(...),
+    likelihood: int = Form(...),
+    owner: str = Form("unknown"),
+    status: str = Form("OPEN"),
+):
+    rid = create_risk(title.strip(), description.strip(), category.strip(), impact, likelihood, owner.strip(), status.strip().upper())
+    return {"id": rid}
+
+@router.post("/api/control")
+def api_add_control(
+    code: str = Form(...),
+    framework: str = Form("CUSTOM"),
+    title: str = Form(...),
+    description: str = Form(...),
+    effectiveness: int = Form(...),
+    review_days: int = Form(...),
+):
+    cid = create_control(code.strip(), framework.strip(), title.strip(), description.strip(), effectiveness, review_days)
+    return {"id": cid}
+
+@router.post("/api/link")
+def api_link(risk_id: str = Form(...), control_id: str = Form(...), weight: float = Form(1.0)):
+    link_control(risk_id.strip(), control_id.strip(), weight)
+    return {"ok": True}
+
+@router.post("/api/assessment")
+def api_assessment(
+    control_id: str = Form(...),
+    result: str = Form(...),
+    confidence: int = Form(7),
+    assessor: str = Form("unknown"),
+    notes: str = Form(""),
+):
+    aid = add_assessment(control_id.strip(), result.strip(), confidence, assessor.strip(), notes.strip())
+    return {"id": aid}
+
+@router.post("/api/evidence")
+async def api_evidence(
+    control_id: str = Form(...),
+    note: str = Form(""),
+    file: UploadFile = File(...),
+):
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "empty file")
+    eid = add_evidence(control_id.strip(), file.filename or "evidence.bin", data, note.strip())
+    return {"id": eid}
+
+@router.get("/api/dashboard")
+def api_dashboard():
+    return dashboard(500)
+
+@router.get("/api/risk/{risk_id}")
+def api_risk(risk_id: str):
+    return risk_breakdown(risk_id)
+
+@router.get("/api/export/audit-pack", response_class=PlainTextResponse)
+def api_export_md():
+    pack = export_audit_pack("latest")
+    # Create a compact Markdown export
+    lines = []
+    lines.append("# RiskLedger Audit Pack (latest)")
+    lines.append("")
+    lines.append("## Dashboard (sorted by residual risk)")
+    for it in pack["risk_breakdowns"]:
+        r = it["risk"]
+        e = it["explain"]
+        lines.append(f"- **{r['title']}** ({r['category']}) owner={r['owner']} status={r['status']}  ")
+        lines.append(f"  inherent={e['inherent']} coverage={e['coverage']} residual={e['residual']}")
+    lines.append("")
+    lines.append("## Risk Breakdowns (why)")
+    for it in pack["risk_breakdowns"]:
+        r = it["risk"]
+        e = it["explain"]
+        lines.append(f"### {r['title']}")
+        lines.append(f"- Inherent: {e['inherent']}")
+        lines.append(f"- Coverage: {e['coverage']}")
+        lines.append(f"- Residual: {e['residual']}")
+        lines.append("")
+        lines.append("Controls:")
+        for c in e["controls"]:
+            lines.append(f"- {c['code']} health={c['health']} weight={c['weight']} contribution={c['contribution']}")
+        lines.append("")
+    return "\n".join(lines)
+PY
+
+cat > "$APP_DIR/app/riskledger/main.py" <<'PY'
+from pathlib import Path
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+from .db import init_db
+from .web import router
+from .catalog import BUILTIN_CONTROLS
+from .service import create_control
+from .db import connect
+
+init_db()
+
+app = FastAPI(title="RiskLedger")
+app.include_router(router)
+
+BASE = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+
+def _seed_once():
+    # Seed builtin controls if DB empty
+    with connect() as c:
+        n = c.execute("SELECT COUNT(*) as n FROM controls").fetchone()["n"]
+    if n and int(n) > 0:
+        return
+    # Default: effectiveness=3, review_days=30
+    for c in BUILTIN_CONTROLS:
+        create_control(
+            c["code"],
+            c["framework"],
+            c["title"],
+            c["description"],
+            effectiveness=3,
+            review_days=30,
+        )
+
+_seed_once()
+PY
+
+cat > "$APP_DIR/app/riskledger/templates/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>RiskLedger</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    input,textarea,select,button{font-size:14px;padding:10px}
+    textarea{width:100%;min-height:120px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    .muted{color:#666}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #ddd;border-radius:999px;font-size:12px}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <h1>RiskLedger</h1>
+  <p class="muted">Local continuous compliance: risks as ledger entries + controls + evidence + assessments + residual risk.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Add Risk</h3>
+      <form method="post" action="/api/risk">
+        <input name="title" placeholder="Title" style="width:100%" required><br><br>
+        <textarea name="description" placeholder="Description" required></textarea><br>
+        <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
+          <input name="category" placeholder="Category (e.g. Identity, Logging)" value="GENERAL">
+          <input name="owner" placeholder="Owner" value="unknown">
+        </div><br>
+        <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
+          <input name="impact" placeholder="Impact 1-5" type="number" min="1" max="5" required>
+          <input name="likelihood" placeholder="Likelihood 1-5" type="number" min="1" max="5" required>
+        </div><br>
+        <select name="status">
+          <option>OPEN</option>
+          <option>MITIGATING</option>
+          <option>ACCEPTED</option>
+          <option>CLOSED</option>
+        </select>
+        <button type="submit">Create</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Add Control</h3>
+      <form method="post" action="/api/control">
+        <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
+          <input name="code" placeholder="Code (e.g. NIS2-M10 or ISO-TECH-LOGGING)" required>
+          <input name="framework" placeholder="Framework (NIS2/ISO27001/CUSTOM)" value="CUSTOM" required>
+        </div><br>
+        <input name="title" placeholder="Title" style="width:100%" required><br><br>
+        <textarea name="description" placeholder="Description" required></textarea><br>
+        <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
+          <input name="effectiveness" placeholder="Effectiveness 1-5" type="number" min="1" max="5" value="3" required>
+          <input name="review_days" placeholder="Review days (freshness window)" type="number" min="1" value="30" required>
+        </div><br>
+        <button type="submit">Create</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h3>Link Control → Risk</h3>
+    <form method="post" action="/api/link">
+      <div class="grid" style="grid-template-columns:1fr 1fr 1fr;gap:10px">
+        <select name="risk_id" required>
+          <option value="">Select risk...</option>
+          {% for r in risks %}
+            <option value="{{r.id}}">{{r.title}}</option>
+          {% endfor %}
+        </select>
+        <select name="control_id" required>
+          <option value="">Select control...</option>
+          {% for c in controls %}
+            <option value="{{c.id}}">{{c.framework}} {{c.code}} — {{c.title}}</option>
+          {% endfor %}
+        </select>
+        <input name="weight" placeholder="Coverage weight (default 1.0)" value="1.0">
+      </div><br>
+      <button type="submit">Link</button>
+    </form>
+    <p class="muted">Tip: higher weight = that control contributes more to coverage for that risk.</p>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h3>Dashboard (sorted by residual risk)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Risk</th>
+          <th>Owner</th>
+          <th>Status</th>
+          <th>Inherent</th>
+          <th>Coverage</th>
+          <th>Residual</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for it in dash.items %}
+        <tr>
+          <td><a href="/risk/{{it.id}}"><b>{{it.title}}</b></a><br><span class="muted">{{it.category}}</span></td>
+          <td>{{it.owner}}</td>
+          <td><span class="pill">{{it.status}}</span></td>
+          <td>{{it.inherent}}</td>
+          <td>{{it.coverage}}</td>
+          <td><b>{{it.residual}}</b></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div style="margin-top:12px">
+      <a href="/api/export/audit-pack">Export audit pack (Markdown)</a>
+    </div>
+  </div>
+
+  <p class="muted" style="margin-top:12px">
+    Evidence/assessments are added from the Risk detail page.
+  </p>
+
+</body>
+</html>
+HTML
+
+cat > "$APP_DIR/app/riskledger/templates/risk.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>RiskLedger - Risk</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    input,textarea,select,button{font-size:14px;padding:10px}
+    textarea{width:100%;min-height:90px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:12px}
+    .muted{color:#666}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <a href="/">← Back</a>
+  <h1>{{bd.risk.title}}</h1>
+  <p class="muted">{{bd.risk.description}}</p>
+
+  <div class="card">
+    <h3>Scores</h3>
+    <div><b>Inherent:</b> {{bd.explain.inherent}}</div>
+    <div><b>Coverage:</b> {{bd.explain.coverage}}</div>
+    <div><b>Residual:</b> <b>{{bd.explain.residual}}</b></div>
+  </div>
+
+  <div class="grid" style="margin-top:14px">
+    <div class="card">
+      <h3>Add Assessment (latest drives health)</h3>
+      <form method="post" action="/api/assessment">
+        <input type="hidden" name="control_id" id="assess_control_id" value="">
+        <select id="assess_select" required>
+          <option value="">Select linked control...</option>
+          {% for c in links %}
+            <option value="{{c.control_id}}">{{c.framework}} {{c.code}} — {{c.title}}</option>
+          {% endfor %}
+        </select><br><br>
+
+        <select name="result">
+          <option>PASS</option>
+          <option>PARTIAL</option>
+          <option>FAIL</option>
+        </select><br><br>
+
+        <input name="confidence" type="number" min="1" max="10" value="7"><br><br>
+        <input name="assessor" placeholder="Assessor" value="unknown"><br><br>
+        <textarea name="notes" placeholder="Notes"></textarea><br>
+        <button type="submit" onclick="syncAssess()">Add assessment</button>
+      </form>
+      <p class="muted">Health = effectiveness × assessment × evidence freshness</p>
+    </div>
+
+    <div class="card">
+      <h3>Upload Evidence</h3>
+      <form method="post" action="/api/evidence" enctype="multipart/form-data">
+        <input type="hidden" name="control_id" id="evi_control_id" value="">
+        <select id="evi_select" required>
+          <option value="">Select linked control...</option>
+          {% for c in links %}
+            <option value="{{c.control_id}}">{{c.framework}} {{c.code}} — {{c.title}}</option>
+          {% endfor %}
+        </select><br><br>
+
+        <input type="file" name="file" required><br><br>
+        <textarea name="note" placeholder="Evidence note (what is this file proving?)"></textarea><br>
+        <button type="submit" onclick="syncEvi()">Upload</button>
+      </form>
+      <p class="muted">Evidence freshness decays after the control’s review_days window.</p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h3>Why (breakdown)</h3>
+    <pre>{{ bd.explain | tojson(indent=2) }}</pre>
+  </div>
+
+<script>
+function syncAssess(){
+  const sel = document.getElementById('assess_select');
+  document.getElementById('assess_control_id').value = sel.value;
+}
+function syncEvi(){
+  const sel = document.getElementById('evi_select');
+  document.getElementById('evi_control_id').value = sel.value;
+}
+</script>
+
+</body>
+</html>
+HTML
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Open UI:"
+echo "  http://localhost:${PORT}"
+echo
+echo "Minimum flow:"
+echo "  1) Add risk"
+echo "  2) Add control"
+echo "  3) Link control -> risk"
+echo "  4) Open risk page, add assessment + evidence"
+echo "  5) See residual risk update"
