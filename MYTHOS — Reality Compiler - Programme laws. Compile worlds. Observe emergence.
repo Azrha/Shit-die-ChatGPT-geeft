@@ -1,0 +1,960 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# MYTHOS — Reality Compiler
+# =========================
+# Creates a full working project:
+# - Streamlit UI (live editing + run/pause + paradox view + export)
+# - Law DSL (Lark grammar) -> compiled rule graph
+# - World kernel (particles + fields + perception + sound + decay)
+# - Paradox engine (static conflicts + dynamic instability flags)
+#
+# Run:
+#   cd mythos && python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#   streamlit run app.py
+#
+# Local-first. No external services.
+
+APP_DIR="mythos"
+mkdir -p "$APP_DIR"/{engine,examples,assets,.streamlit}
+
+cat > "$APP_DIR/requirements.txt" <<'REQ'
+streamlit==1.40.2
+numpy==2.1.3
+pillow==10.4.0
+lark==1.2.2
+REQ
+
+cat > "$APP_DIR/.streamlit/config.toml" <<'TOML'
+[server]
+headless = true
+runOnSave = true
+
+[browser]
+gatherUsageStats = false
+TOML
+
+cat > "$APP_DIR/README.md" <<'MD'
+# MYTHOS — Reality Compiler
+
+You don't program steps. You program **laws**.
+
+Write laws in the MYTHOS DSL → compile → a world emerges.
+
+## Run
+~~~bash
+cd mythos
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
+~~~
+
+## DSL overview (quick)
+- Define constants:
+  ~~~
+  const G = 0.35
+  const MAX_SPEED = 4.0
+  ~~~
+- Define laws:
+  ~~~
+  law gravity priority 10
+    when true
+    do vy += G
+  end
+  ~~~
+
+- Entity fields you can use in `when`:
+  - `x,y,vx,vy,mass,hardness,color,age,seen,alive,sound`
+- Effects you can use in `do`:
+  - `x += expr`, `y += expr`, `vx += expr`, `vy += expr`
+  - `mass *= expr`, `hardness += expr`, `sound += expr`
+  - `seen = expr`, `alive = expr`
+  - `emit_sound expr` (adds sound energy to entity + local field)
+  - `attract(radius, strength, selector)` (field interaction)
+  - `repel(radius, strength, selector)`
+  - `decay_unseen(rate)` (kills entities not observed)
+  - `fade_color(rate)` (towards gray)
+  - `clamp_speed(MAX_SPEED)`
+  - `wrap(bounds)` (toroidal world)
+
+## Paradox
+MYTHOS highlights:
+- Static paradoxes (conflicting constant redefinitions; invalid effects)
+- Dynamic instability (runaway acceleration; exploding sound; conflicting hardening/softening loops)
+
+## Examples
+- `examples/basic.law`
+- `examples/weird_physics.law`
+- `examples/paradox.law`
+MD
+
+cat > "$APP_DIR/examples/basic.law" <<'LAW'
+# A clean starting universe
+
+const W = 256
+const H = 256
+const DT = 1.0
+const G = 0.12
+const MAX_SPEED = 3.5
+
+# Everything experiences gravity
+law gravity priority 10
+  when true
+  do vy += G
+end
+
+# Metal is attracted to red objects (we treat color tags as strings)
+law red_magnetism priority 8
+  when color == "metal"
+  do attract(70, 0.55, color == "red")
+end
+
+# Things that aren't looked at slowly die
+law unobserved_decay priority 6
+  when true
+  do decay_unseen(0.015)
+end
+
+# Sound can harden matter (local field)
+law sound_hardens priority 7
+  when sound > 0.3
+  do hardness += 0.08 * sound
+end
+
+# Anything too fast gets clamped
+law clamp priority 100
+  when true
+  do clamp_speed(MAX_SPEED)
+end
+
+# Wrap world edges
+law wrap priority 1000
+  when true
+  do wrap(W, H)
+end
+LAW
+
+cat > "$APP_DIR/examples/weird_physics.law" <<'LAW'
+# Weird physics: red objects float, blue objects get heavier,
+# and unseen objects fade into gray before dying.
+
+const W = 256
+const H = 256
+const DT = 1.0
+const MAX_SPEED = 4.0
+const G = 0.16
+
+law gravity priority 10
+  when true
+  do vy += G
+end
+
+law red_buoyancy priority 12
+  when color == "red"
+  do vy -= 0.28
+end
+
+law blue_mass priority 9
+  when color == "blue"
+  do mass *= 1.003
+end
+
+law fade_to_gray priority 7
+  when seen < 0.5
+  do fade_color(0.02)
+end
+
+law unseen_decay priority 6
+  when true
+  do decay_unseen(0.012)
+end
+
+law clamp priority 100
+  when true
+  do clamp_speed(MAX_SPEED)
+end
+
+law wrap priority 1000
+  when true
+  do wrap(W, H)
+end
+LAW
+
+cat > "$APP_DIR/examples/paradox.law" <<'LAW'
+# Intentional paradox/unhealthy loop:
+# Sound hardens AND softens at the same time. Watch paradox heatmap.
+const W = 256
+const H = 256
+const DT = 1.0
+const MAX_SPEED = 10.0
+const G = 0.08
+
+law gravity priority 10
+  when true
+  do vy += G
+end
+
+law sound_hardens priority 9
+  when sound > 0.2
+  do hardness += 0.12 * sound
+end
+
+law sound_softens priority 9
+  when sound > 0.2
+  do hardness -= 0.12 * sound
+end
+
+law generate_sound priority 8
+  when true
+  do emit_sound(0.10)
+end
+
+law clamp priority 100
+  when true
+  do clamp_speed(MAX_SPEED)
+end
+
+law wrap priority 1000
+  when true
+  do wrap(W, H)
+end
+LAW
+
+cat > "$APP_DIR/engine/grammar.lark" <<'LARK'
+start: stmt*
+
+?stmt: const_stmt
+     | law_stmt
+     | COMMENT
+
+const_stmt: "const" NAME "=" expr _NL
+
+law_stmt: "law" NAME "priority" SIGNED_NUMBER _NL
+          "when" expr _NL
+          "do" action_list _NL
+          "end" _NL
+
+action_list: action ("," action)*
+
+?action: assign
+       | call
+
+assign: NAME assign_op expr
+assign_op: "+="|"-="|"*="|"/="|"="
+
+call: NAME "(" [args] ")"
+args: expr ("," expr)*
+
+?expr: or_expr
+?or_expr: and_expr ("or" and_expr)*
+?and_expr: cmp_expr ("and" cmp_expr)*
+?cmp_expr: sum (CMP sum)*
+CMP: "=="|"!="|"<="|">="|"<"|">"
+
+?sum: term (("+"|"-") term)*
+?term: factor (("*"|"/") factor)*
+?factor: ("+"|"-") factor
+       | atom
+
+?atom: NUMBER           -> number
+     | SIGNED_NUMBER    -> number
+     | ESCAPED_STRING   -> string
+     | NAME             -> var
+     | "true"           -> true
+     | "false"          -> false
+     | "(" expr ")"
+
+COMMENT: /#[^\n]*/
+_NL: /(\r?\n)+/
+
+%import common.CNAME -> NAME
+%import common.SIGNED_NUMBER
+%import common.NUMBER
+%import common.ESCAPED_STRING
+%import common.WS_INLINE
+%ignore WS_INLINE
+%ignore COMMENT
+LARK
+
+cat > "$APP_DIR/engine/safeexpr.py" <<'PY'
+import ast
+from dataclasses import dataclass
+from typing import Any, Dict
+
+ALLOWED_NODES = {
+    ast.Expression,
+    ast.BoolOp, ast.BinOp, ast.UnaryOp,
+    ast.Compare,
+    ast.Name, ast.Load,
+    ast.Constant,
+    ast.And, ast.Or,
+    ast.Add, ast.Sub, ast.Mult, ast.Div,
+    ast.UAdd, ast.USub,
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+}
+
+@dataclass(frozen=True)
+class CompiledExpr:
+    src: str
+    tree: ast.AST
+
+def _validate(node: ast.AST) -> None:
+    for n in ast.walk(node):
+        if type(n) not in ALLOWED_NODES:
+            raise ValueError(f"Unsafe/unsupported expression node: {type(n).__name__}")
+
+def compile_expr(src: str) -> CompiledExpr:
+    src = src.strip()
+    try:
+        tree = ast.parse(src, mode="eval")
+    except Exception as e:
+        raise ValueError(f"Invalid expression: {src} ({e})")
+    _validate(tree)
+    return CompiledExpr(src=src, tree=tree)
+
+def eval_expr(expr: CompiledExpr, env: Dict[str, Any]) -> Any:
+    code = compile(expr.tree, "<mythos-expr>", "eval")
+    return eval(code, {"__builtins__": {}}, env)
+PY
+
+cat > "$APP_DIR/engine/model.py" <<'PY'
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Any, List
+import numpy as np
+
+@dataclass
+class Entity:
+    id: int
+    x: float
+    y: float
+    vx: float
+    vy: float
+    mass: float
+    hardness: float
+    color: str
+    age: float = 0.0
+    seen: float = 1.0
+    alive: bool = True
+    sound: float = 0.0
+
+    def as_env(self) -> Dict[str, Any]:
+        return {
+            "x": self.x, "y": self.y, "vx": self.vx, "vy": self.vy,
+            "mass": self.mass, "hardness": self.hardness, "color": self.color,
+            "age": self.age, "seen": self.seen, "alive": self.alive, "sound": self.sound,
+            "true": True, "false": False,
+        }
+
+    def apply_env(self, env: Dict[str, Any]) -> None:
+        self.x = float(env.get("x", self.x))
+        self.y = float(env.get("y", self.y))
+        self.vx = float(env.get("vx", self.vx))
+        self.vy = float(env.get("vy", self.vy))
+        self.mass = float(env.get("mass", self.mass))
+        self.hardness = float(env.get("hardness", self.hardness))
+        self.seen = float(env.get("seen", self.seen))
+        self.alive = bool(env.get("alive", self.alive))
+        self.sound = float(env.get("sound", self.sound))
+
+@dataclass
+class World:
+    w: int
+    h: int
+    dt: float
+    time: float = 0.0
+    entities: List[Entity] = None
+    sound_field: np.ndarray = None
+    paradox_heat: np.ndarray = None
+
+    def __post_init__(self):
+        if self.entities is None:
+            self.entities = []
+        if self.sound_field is None:
+            self.sound_field = np.zeros((self.h, self.w), dtype=np.float32)
+        if self.paradox_heat is None:
+            self.paradox_heat = np.zeros((self.h, self.w), dtype=np.float32)
+
+    def step_integrate(self):
+        self.time += self.dt
+
+        self.sound_field *= 0.92
+        sf = self.sound_field
+        sf[:] = (sf + np.roll(sf,1,0) + np.roll(sf,-1,0) + np.roll(sf,1,1) + np.roll(sf,-1,1)) / 5.0
+
+        self.paradox_heat *= 0.96
+
+        for e in self.entities:
+            if not e.alive:
+                continue
+            e.x += e.vx * self.dt
+            e.y += e.vy * self.dt
+            e.age += self.dt
+            e.seen = max(0.0, e.seen - 0.01)
+
+            ix = int(max(0, min(self.w-1, round(e.x))))
+            iy = int(max(0, min(self.h-1, round(e.y))))
+            e.sound = float(self.sound_field[iy, ix])
+PY
+
+cat > "$APP_DIR/engine/laws.py" <<'PY'
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List
+from .safeexpr import CompiledExpr
+
+@dataclass
+class Action:
+    kind: str  # "assign" or "call"
+    name: str
+    op: str = ""
+    expr: CompiledExpr | None = None
+    args: List[CompiledExpr] | None = None
+
+@dataclass
+class Law:
+    name: str
+    priority: int
+    when: CompiledExpr
+    actions: List[Action]
+PY
+
+cat > "$APP_DIR/engine/compiler.py" <<'PY'
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, List, Any
+from lark import Lark, Transformer
+from .laws import Law, Action
+from .safeexpr import compile_expr
+
+GRAMMAR_PATH = __file__.replace("compiler.py", "grammar.lark")
+
+class _AST(Transformer):
+    def start(self, items):
+        consts = {}
+        laws = []
+        for it in items:
+            if it is None:
+                continue
+            if isinstance(it, tuple) and it[0] == "const":
+                consts[it[1]] = it[2]
+            elif isinstance(it, Law):
+                laws.append(it)
+        return {"consts": consts, "laws": laws}
+
+    def const_stmt(self, items):
+        name = str(items[0])
+        expr_src = str(items[1])
+        return ("const", name, compile_expr(expr_src))
+
+    def law_stmt(self, items):
+        name = str(items[0])
+        prio = int(float(items[1]))
+        when_src = str(items[2])
+        actions = items[3]
+        return Law(name=name, priority=prio, when=compile_expr(when_src), actions=actions)
+
+    def action_list(self, items):
+        return items
+
+    def assign_op(self, items):
+        return str(items[0])
+
+    def assign(self, items):
+        var = str(items[0])
+        op = str(items[1])
+        expr_src = str(items[2])
+        return Action(kind="assign", name=var, op=op, expr=compile_expr(expr_src))
+
+    def call(self, items):
+        fname = str(items[0])
+        args = []
+        if len(items) > 1 and items[1] is not None:
+            args = items[1]
+        return Action(kind="call", name=fname, args=args)
+
+    def args(self, items):
+        return [compile_expr(str(x)) for x in items]
+
+    def var(self, items): return str(items[0])
+    def number(self, items): return str(items[0])
+    def string(self, items): return str(items[0])
+    def true(self, _): return "true"
+    def false(self, _): return "false"
+
+def _load_grammar() -> str:
+    with open(GRAMMAR_PATH, "r", encoding="utf-8") as f:
+        return f.read()
+
+_PARSER = Lark(_load_grammar(), parser="lalr", maybe_placeholders=False, propagate_positions=True)
+
+@dataclass
+class CompiledProgram:
+    consts: Dict[str, Any]
+    laws: List[Law]
+
+def compile_program(src: str) -> CompiledProgram:
+    tree = _PARSER.parse(src + "\n")
+    ast = _AST().transform(tree)
+    return CompiledProgram(consts=ast["consts"], laws=ast["laws"])
+PY
+
+cat > "$APP_DIR/engine/paradox.py" <<'PY'
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+import numpy as np
+
+from .laws import Law
+
+@dataclass
+class ParadoxReport:
+    static_errors: List[str]
+    warnings: List[str]
+
+def static_check(consts: Dict[str, Any], laws: List[Law]) -> ParadoxReport:
+    errs = []
+    warns = []
+
+    seen = {}
+    for l in laws:
+        key = (l.name, l.priority)
+        if key in seen:
+            warns.append(f"Duplicate law name+priority: {l.name} priority {l.priority}")
+        seen[key] = True
+
+    allowed_vars = {"x","y","vx","vy","mass","hardness","seen","alive","sound"}
+    allowed_calls = {"emit_sound","attract","repel","decay_unseen","fade_color","clamp_speed","wrap"}
+    for l in laws:
+        for a in l.actions:
+            if a.kind == "assign":
+                if a.name not in allowed_vars:
+                    errs.append(f"Law '{l.name}': cannot assign to '{a.name}'")
+            elif a.kind == "call":
+                if a.name not in allowed_calls:
+                    errs.append(f"Law '{l.name}': unknown call '{a.name}()'")
+
+    return ParadoxReport(static_errors=errs, warnings=warns)
+
+def dynamic_instability_flags(world, max_speed: float) -> Tuple[float, float]:
+    speeds = []
+    sounds = []
+    for e in world.entities:
+        if not e.alive:
+            continue
+        speeds.append((e.vx*e.vx + e.vy*e.vy) ** 0.5)
+        sounds.append(e.sound)
+    if not speeds:
+        return (0.0, 0.0)
+    vmax = float(np.max(speeds))
+    smax = float(np.max(sounds)) if sounds else 0.0
+    speed_score = max(0.0, (vmax - max_speed) / max_speed)
+    sound_score = max(0.0, (smax - 1.5) / 1.5)
+    return (speed_score, sound_score)
+PY
+
+cat > "$APP_DIR/engine/kernel.py" <<'PY'
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Any, List, Tuple
+import math
+import numpy as np
+
+from .model import World, Entity
+from .laws import Law, Action
+from .safeexpr import eval_expr
+from .paradox import dynamic_instability_flags
+
+@dataclass
+class RuntimeConfig:
+    max_speed: float = 4.0
+
+class Kernel:
+    def __init__(self, world: World, consts: Dict[str, Any], laws: List[Law]):
+        self.world = world
+        self.consts_expr = consts
+        self.laws = sorted(laws, key=lambda l: l.priority, reverse=True)
+        self.consts: Dict[str, Any] = {}
+        self.cfg = RuntimeConfig(max_speed=4.0)
+        self._compile_consts()
+
+    def _compile_consts(self):
+        env = {"true": True, "false": False}
+        for k, expr in self.consts_expr.items():
+            env.update(self.consts)
+            self.consts[k] = eval_expr(expr, env)
+
+        if "MAX_SPEED" in self.consts:
+            try:
+                self.cfg.max_speed = float(self.consts["MAX_SPEED"])
+            except Exception:
+                pass
+
+        if "W" in self.consts:
+            self.world.w = int(float(self.consts["W"]))
+        if "H" in self.consts:
+            self.world.h = int(float(self.consts["H"]))
+        if "DT" in self.consts:
+            self.world.dt = float(self.consts["DT"])
+
+        self.world.sound_field = np.zeros((self.world.h, self.world.w), dtype=np.float32)
+        self.world.paradox_heat = np.zeros((self.world.h, self.world.w), dtype=np.float32)
+
+    def tick(self, observer_xy: Tuple[int,int] | None = None, observer_radius: int = 55):
+        if observer_xy is not None:
+            ox, oy = observer_xy
+            r2 = observer_radius * observer_radius
+            for e in self.world.entities:
+                if not e.alive:
+                    continue
+                dx = e.x - ox
+                dy = e.y - oy
+                if dx*dx + dy*dy <= r2:
+                    e.seen = 1.0
+
+        for e in self.world.entities:
+            if not e.alive:
+                continue
+
+            for law in self.laws:
+                if not e.alive:
+                    break
+                env = e.as_env()
+                env.update(self.consts)
+
+                ok = bool(eval_expr(law.when, env))
+                if not ok:
+                    continue
+
+                for a in law.actions:
+                    if a.kind == "assign":
+                        val = eval_expr(a.expr, env)
+                        cur = env.get(a.name)
+                        if a.op == "=":
+                            env[a.name] = val
+                        elif a.op == "+=":
+                            env[a.name] = cur + val
+                        elif a.op == "-=":
+                            env[a.name] = cur - val
+                        elif a.op == "*=":
+                            env[a.name] = cur * val
+                        elif a.op == "/=":
+                            env[a.name] = cur / val if val != 0 else cur
+                    else:
+                        self._call(a.name, a.args or [], env, e)
+
+                e.apply_env(env)
+
+        self.world.step_integrate()
+
+        speed_score, sound_score = dynamic_instability_flags(self.world, self.cfg.max_speed)
+        if speed_score > 0 or sound_score > 0:
+            self.world.paradox_heat[:] += float(speed_score + sound_score) * 0.15
+            self.world.paradox_heat[:] = np.clip(self.world.paradox_heat, 0.0, 1.0)
+
+    def _call(self, name: str, args, env: Dict[str, Any], e: Entity):
+        avals = [eval_expr(x, env) for x in args]
+
+        if name == "emit_sound":
+            amt = float(avals[0]) if avals else 0.1
+            e.sound += amt
+            ix = int(max(0, min(self.world.w-1, round(e.x))))
+            iy = int(max(0, min(self.world.h-1, round(e.y))))
+            self.world.sound_field[iy, ix] += amt
+
+        elif name in ("attract", "repel"):
+            radius = float(avals[0])
+            strength = float(avals[1])
+            selector_expr = args[2] if len(args) >= 3 else None
+            self._field_pull(e, radius, strength, selector_expr, mode=name)
+
+        elif name == "decay_unseen":
+            rate = float(avals[0]) if avals else 0.01
+            if e.seen <= 0.2:
+                r = (math.sin(e.age*12.345 + e.x*0.17 + e.y*0.31) + 1.0) * 0.5
+                if r < rate:
+                    e.alive = False
+
+        elif name == "fade_color":
+            rate = float(avals[0]) if avals else 0.02
+            if e.color != "gray" and e.seen < 0.6:
+                r = (math.sin(e.age*3.21) + 1.0) * 0.5
+                if r < rate:
+                    e.color = "gray"
+
+        elif name == "clamp_speed":
+            ms = float(avals[0]) if avals else self.cfg.max_speed
+            v = (e.vx*e.vx + e.vy*e.vy) ** 0.5
+            if v > ms and v > 0:
+                s = ms / v
+                e.vx *= s
+                e.vy *= s
+
+        elif name == "wrap":
+            W = int(float(avals[0]))
+            H = int(float(avals[1]))
+            e.x = e.x % W
+            e.y = e.y % H
+
+    def _field_pull(self, e: Entity, radius: float, strength: float, selector_expr, mode: str):
+        r2 = radius * radius
+        for other in self.world.entities:
+            if (not other.alive) or other.id == e.id:
+                continue
+            dx = other.x - e.x
+            dy = other.y - e.y
+            d2 = dx*dx + dy*dy
+            if d2 <= 1e-6 or d2 > r2:
+                continue
+
+            if selector_expr is not None:
+                oenv = other.as_env()
+                oenv.update(self.consts)
+                if not bool(eval_expr(selector_expr, oenv)):
+                    continue
+
+            inv = 1.0 / (d2 + 8.0)
+            fx = dx * inv * strength
+            fy = dy * inv * strength
+            if mode == "repel":
+                fx, fy = -fx, -fy
+
+            e.vx += fx / max(0.1, e.mass)
+            e.vy += fy / max(0.1, e.mass)
+PY
+
+cat > "$APP_DIR/engine/render.py" <<'PY'
+from __future__ import annotations
+import numpy as np
+from PIL import Image
+
+COLOR_MAP = {
+    "red": (255, 70, 70),
+    "blue": (70, 120, 255),
+    "green": (70, 255, 140),
+    "metal": (190, 190, 210),
+    "gray": (160, 160, 160),
+    "gold": (255, 210, 90),
+}
+
+def render(world, show_sound: bool = True, show_paradox: bool = True) -> Image.Image:
+    h, w = world.h, world.w
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+
+    if show_sound:
+        s = world.sound_field
+        s = np.clip(s, 0.0, 2.0) / 2.0
+        img[..., 2] = (s * 140).astype(np.uint8)
+        img[..., 1] = (s * 40).astype(np.uint8)
+
+    for e in world.entities:
+        if not e.alive:
+            continue
+        x = int(max(0, min(w-1, round(e.x))))
+        y = int(max(0, min(h-1, round(e.y))))
+        base = COLOR_MAP.get(e.color, (220, 220, 220))
+        img[y, x, :] = base
+
+        r = int(max(1, min(6, 1 + e.hardness * 0.6)))
+        for dy in range(-r, r+1):
+            yy = y + dy
+            if yy < 0 or yy >= h:
+                continue
+            for dx in range(-r, r+1):
+                xx = x + dx
+                if xx < 0 or xx >= w:
+                    continue
+                if dx*dx + dy*dy <= r*r:
+                    a = 0.20
+                    img[yy, xx, 0] = int(img[yy, xx, 0] * (1-a) + base[0] * a)
+                    img[yy, xx, 1] = int(img[yy, xx, 1] * (1-a) + base[1] * a)
+                    img[yy, xx, 2] = int(img[yy, xx, 2] * (1-a) + base[2] * a)
+
+    if show_paradox:
+        p = np.clip(world.paradox_heat, 0.0, 1.0)
+        img[..., 0] = np.maximum(img[..., 0], (p * 255).astype(np.uint8))
+        img[..., 1] = (img[..., 1] * (1.0 - 0.35*p)).astype(np.uint8)
+        img[..., 2] = (img[..., 2] * (1.0 - 0.35*p)).astype(np.uint8)
+
+    return Image.fromarray(img, mode="RGB")
+PY
+
+cat > "$APP_DIR/engine/factory.py" <<'PY'
+from __future__ import annotations
+import random
+from .model import World, Entity
+
+def seed_world(w: int, h: int, n: int = 120, seed: int = 42) -> World:
+    rng = random.Random(seed)
+    world = World(w=w, h=h, dt=1.0, entities=[])
+
+    palette = ["red", "blue", "green", "metal", "gold", "gray"]
+    for i in range(n):
+        color = rng.choice(palette)
+        x = rng.uniform(0, w-1)
+        y = rng.uniform(0, h-1)
+        vx = rng.uniform(-0.6, 0.6)
+        vy = rng.uniform(-0.6, 0.6)
+        mass = 1.0 + (0.8 if color == "metal" else 0.0) + rng.uniform(0.0, 0.6)
+        hardness = 0.5 + (0.8 if color == "metal" else 0.0) + rng.uniform(0.0, 1.0)
+        world.entities.append(Entity(
+            id=i+1, x=x, y=y, vx=vx, vy=vy,
+            mass=mass, hardness=hardness, color=color
+        ))
+    return world
+PY
+
+cat > "$APP_DIR/app.py" <<'PY'
+import time
+from pathlib import Path
+import streamlit as st
+
+from engine.compiler import compile_program
+from engine.paradox import static_check
+from engine.factory import seed_world
+from engine.kernel import Kernel
+from engine.render import render
+
+st.set_page_config(page_title="MYTHOS — Reality Compiler", layout="wide")
+
+ROOT = Path(__file__).resolve().parent
+EXAMPLES = sorted((ROOT / "examples").glob("*.law"))
+
+def load_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8")
+
+if "src" not in st.session_state:
+    st.session_state.src = load_text(EXAMPLES[0]) if EXAMPLES else ""
+if "tick_ms" not in st.session_state:
+    st.session_state.tick_ms = 60
+if "seed" not in st.session_state:
+    st.session_state.seed = 42
+if "n" not in st.session_state:
+    st.session_state.n = 140
+
+st.title("MYTHOS — Reality Compiler")
+st.caption("Write laws. Compile worlds. Observe emergence. Patch paradoxes.")
+
+left, right = st.columns([0.9, 1.1], gap="large")
+
+with left:
+    st.subheader("Laws (DSL)")
+    ex = st.selectbox("Load example", options=[p.name for p in EXAMPLES], index=0 if EXAMPLES else 0)
+    if EXAMPLES and st.button("Load selected example"):
+        p = next((x for x in EXAMPLES if x.name == ex), None)
+        if p:
+            st.session_state.src = load_text(p)
+
+    st.session_state.src = st.text_area("Edit laws", value=st.session_state.src, height=520)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.session_state.seed = st.number_input("Seed", min_value=0, max_value=999999, value=int(st.session_state.seed))
+    with c2:
+        st.session_state.n = st.number_input("Entities", min_value=10, max_value=600, value=int(st.session_state.n))
+    with c3:
+        st.session_state.tick_ms = st.number_input("Tick ms", min_value=10, max_value=500, value=int(st.session_state.tick_ms))
+    with c4:
+        observer = st.checkbox("Observer active", value=True)
+
+    st.divider()
+    st.subheader("Export")
+    st.download_button(
+        "Download laws as .law",
+        data=st.session_state.src.encode("utf-8"),
+        file_name="mythos_world.law",
+        mime="text/plain",
+    )
+
+with right:
+    st.subheader("World")
+    status = st.empty()
+    img_box = st.empty()
+    diag = st.empty()
+
+    try:
+        prog = compile_program(st.session_state.src)
+        rep = static_check(prog.consts, prog.laws)
+        if rep.static_errors:
+            status.error("Static errors:\n- " + "\n- ".join(rep.static_errors))
+            st.stop()
+        if rep.warnings:
+            status.warning("Warnings:\n- " + "\n- ".join(rep.warnings))
+        else:
+            status.success("Compiled OK")
+
+        # seed then let Kernel apply consts (W/H/DT/MAX_SPEED)
+        world = seed_world(256, 256, n=int(st.session_state.n), seed=int(st.session_state.seed))
+        kernel = Kernel(world, prog.consts, prog.laws)
+
+        # re-seed with final dimensions
+        W, H = kernel.world.w, kernel.world.h
+        DT = kernel.world.dt
+        world = seed_world(W, H, n=int(st.session_state.n), seed=int(st.session_state.seed))
+        world.dt = DT
+        kernel = Kernel(world, prog.consts, prog.laws)
+
+        ox = st.slider("Observer X", 0, W-1, W//2)
+        oy = st.slider("Observer Y", 0, H-1, H//2)
+        rad = st.slider("Observer radius", 10, 120, 55)
+
+        show_sound = st.checkbox("Show sound field", value=True)
+        show_paradox = st.checkbox("Show paradox heat", value=True)
+
+        run = st.toggle("Run", value=True)
+        steps = st.slider("Steps per frame", 1, 10, 2)
+
+        if run:
+            for _ in range(steps):
+                kernel.tick(observer_xy=(ox, oy) if observer else None, observer_radius=int(rad))
+
+            im = render(kernel.world, show_sound=show_sound, show_paradox=show_paradox)
+            alive_ct = sum(1 for e in kernel.world.entities if e.alive)
+            img_box.image(im, caption=f"t={kernel.world.time:.1f}  alive={alive_ct}/{len(kernel.world.entities)}  MAX_SPEED={kernel.cfg.max_speed:.2f}", use_column_width=True)
+
+            alive = [e for e in kernel.world.entities if e.alive]
+            if alive:
+                vmax = max((e.vx*e.vx + e.vy*e.vy)**0.5 for e in alive)
+                smax = max(e.sound for e in alive)
+                hmax = max(e.hardness for e in alive)
+            else:
+                vmax = smax = hmax = 0.0
+
+            diag.info(
+                "\n".join([
+                    f"World: {W}×{H}  dt={kernel.world.dt}",
+                    f"Alive: {len(alive)}/{len(kernel.world.entities)}",
+                    f"vmax={vmax:.3f}  sound_max={smax:.3f}  hardness_max={hmax:.3f}",
+                    "If paradox heat rises, your laws are fighting or exploding.",
+                ])
+            )
+
+            time.sleep(st.session_state.tick_ms / 1000.0)
+            st.rerun()
+        else:
+            im = render(kernel.world, show_sound=show_sound, show_paradox=show_paradox)
+            img_box.image(im, caption="Paused", use_column_width=True)
+
+    except Exception as e:
+        status.error(f"Compile/runtime error: {e}")
+        st.stop()
+PY
+
+cat > "$APP_DIR/run.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
+SH
+chmod +x "$APP_DIR/run.sh"
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR"
+echo "  ./run.sh"
