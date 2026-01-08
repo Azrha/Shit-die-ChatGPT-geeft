@@ -1,0 +1,940 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# 10) SceneVault — Phone → (frames + YOLO + CLIP) + (optional COLMAP 3D) → Search
+# ==============================================================================
+# Run:
+#   cd scenevault && docker compose up --build
+#
+# Open UI:
+#   http://localhost:9077
+#
+# What you can do:
+#   - Upload a .mp4/.mov OR a .zip of photos (jpg/png)
+#   - Pick:
+#       * frame interval seconds (video)
+#       * enable/disable COLMAP reconstruction
+#   - Worker:
+#       * extracts frames (ffmpeg)
+#       * runs YOLOv8 detection (ultralytics)
+#       * creates CLIP embeddings for frames (openai/CLIP)
+#       * stores everything in SQLite
+#       * bundles artifacts + uploads to MinIO
+#   - Search:
+#       * text → CLIP text embedding → cosine search against frame embeddings
+#       * filter by detected label substring
+#
+# Notes:
+#   - COLMAP can be CPU-only but may be slow; SceneVault still works without it.
+#   - This is local-first; no cloud.
+# ==============================================================================
+
+APP_DIR="scenevault"
+PORT="9077"
+
+MINIO_ROOT_USER="scenevault"
+MINIO_ROOT_PASSWORD="scenevault12345678"
+MINIO_BUCKET="scenevault-artifacts"
+
+mkdir -p "$APP_DIR"/{app/scenevault,app/scenevault/templates,data/{uploads,work,artifacts,minio}}
+
+cat > "$APP_DIR/README.md" <<MD
+# SceneVault — Reality Capture Knowledge Base (local-first)
+
+## Start
+\`\`\`bash
+cd scenevault
+docker compose up --build
+\`\`\`
+
+Open UI:
+- http://localhost:${PORT}
+
+## Inputs
+- Video: .mp4 / .mov
+- Photos: .zip containing .jpg/.jpeg/.png (flat or nested folders)
+
+## Search
+- Text search uses CLIP (text → embedding) vs stored frame embeddings.
+- Label filter matches YOLO detected labels.
+
+## Artifacts per job
+- frames/ (extracted frames)
+- detections.json
+- embeddings.npz
+- (optional) colmap/ (sparse model + exported point cloud if produced)
+- build_logs.txt
+- bundle.tar.gz uploaded to MinIO
+
+MinIO Console:
+- http://localhost:9021  (S3: http://localhost:9020)
+- user: ${MINIO_ROOT_USER}
+MD
+
+cat > "$APP_DIR/docker-compose.yml" <<EOF
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./data/minio:/data
+    ports:
+      - "9020:9000"
+      - "9021:9001"
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    environment:
+      SV_DB: /data/scenevault.sqlite3
+      SV_UPLOADS: /data/uploads
+      SV_WORK: /data/work
+      SV_ARTIFACTS: /data/artifacts
+      SV_REDIS_URL: redis://redis:6379/0
+
+      SV_MINIO_ENDPOINT: http://minio:9000
+      SV_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      SV_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      SV_MINIO_BUCKET: ${MINIO_BUCKET}
+
+      # Models
+      SV_YOLO_MODEL: yolov8n.pt
+      SV_CLIP_MODEL: openai/clip-vit-base-patch32
+    volumes:
+      - ./data:/data
+    ports:
+      - "${PORT}:8000"
+    depends_on:
+      - redis
+      - minio
+    restart: unless-stopped
+
+  worker:
+    build: ./app
+    command: ["python", "-m", "scenevault.worker"]
+    environment:
+      SV_DB: /data/scenevault.sqlite3
+      SV_UPLOADS: /data/uploads
+      SV_WORK: /data/work
+      SV_ARTIFACTS: /data/artifacts
+      SV_REDIS_URL: redis://redis:6379/0
+
+      SV_MINIO_ENDPOINT: http://minio:9000
+      SV_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      SV_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      SV_MINIO_BUCKET: ${MINIO_BUCKET}
+
+      SV_YOLO_MODEL: yolov8n.pt
+      SV_CLIP_MODEL: openai/clip-vit-base-patch32
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+      - minio
+    restart: unless-stopped
+EOF
+
+cat > "$APP_DIR/app/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /srv
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl tar gzip ffmpeg unzip && \
+    rm -rf /var/lib/apt/lists/*
+
+# COLMAP (CPU build via apt on Debian can be flaky; we use prebuilt binary package style via pip is not an option.
+# Instead we install colmap from Debian repos when available; if not, SceneVault continues without COLMAP.
+RUN apt-get update && \
+    (apt-get install -y --no-install-recommends colmap || true) && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY scenevault ./scenevault
+
+EXPOSE 8000
+CMD ["uvicorn", "scenevault.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKER
+
+cat > "$APP_DIR/app/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17
+jinja2==3.1.5
+
+rq==2.1.0
+redis==5.2.1
+minio==7.2.15
+
+pandas==2.2.3
+numpy==2.1.3
+pillow==11.0.0
+
+ultralytics==8.3.60
+torch==2.5.1
+torchvision==0.20.1
+
+transformers==4.48.0
+tokenizers==0.21.0
+accelerate==1.2.1
+REQ
+
+cat > "$APP_DIR/app/scenevault/__init__.py" <<'PY'
+PY
+
+cat > "$APP_DIR/app/scenevault/config.py" <<'PY'
+import os
+from pathlib import Path
+
+DB = Path(os.getenv("SV_DB", "/data/scenevault.sqlite3")).resolve()
+UPLOADS = Path(os.getenv("SV_UPLOADS", "/data/uploads")).resolve()
+WORK = Path(os.getenv("SV_WORK", "/data/work")).resolve()
+ARTIFACTS = Path(os.getenv("SV_ARTIFACTS", "/data/artifacts")).resolve()
+
+REDIS_URL = os.getenv("SV_REDIS_URL", "redis://localhost:6379/0")
+
+MINIO_ENDPOINT = os.getenv("SV_MINIO_ENDPOINT", "http://localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("SV_MINIO_ACCESS_KEY", "scenevault")
+MINIO_SECRET_KEY = os.getenv("SV_MINIO_SECRET_KEY", "scenevault12345678")
+MINIO_BUCKET = os.getenv("SV_MINIO_BUCKET", "scenevault-artifacts")
+
+YOLO_MODEL = os.getenv("SV_YOLO_MODEL", "yolov8n.pt")
+CLIP_MODEL = os.getenv("SV_CLIP_MODEL", "openai/clip-vit-base-patch32")
+PY
+
+cat > "$APP_DIR/app/scenevault/util.py" <<'PY'
+import json, hashlib, tarfile, subprocess
+from pathlib import Path
+from datetime import datetime, timezone
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def jdump(x) -> str:
+    return json.dumps(x, ensure_ascii=False, indent=2)
+
+def run(cmd: list[str], cwd: str | None = None) -> tuple[int,str]:
+    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return p.returncode, p.stdout
+PY
+
+cat > "$APP_DIR/app/scenevault/db.py" <<'PY'
+import sqlite3
+from .config import DB
+
+def connect():
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
+    return c
+
+def init_db():
+    with connect() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          status TEXT NOT NULL,          -- QUEUED/RUNNING/SUCCEEDED/FAILED
+          input_name TEXT NOT NULL,
+          input_type TEXT NOT NULL,      -- video/photos_zip
+          frame_interval REAL NOT NULL,
+          do_colmap INTEGER NOT NULL,
+          logs TEXT NOT NULL,
+          artifact_key TEXT,
+          artifact_sha256 TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS frames (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          job_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          width INTEGER NOT NULL,
+          height INTEGER NOT NULL,
+          sha256 TEXT NOT NULL,
+          FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS detections (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          frame_id INTEGER NOT NULL,
+          label TEXT NOT NULL,
+          conf REAL NOT NULL,
+          x1 REAL NOT NULL,
+          y1 REAL NOT NULL,
+          x2 REAL NOT NULL,
+          y2 REAL NOT NULL,
+          FOREIGN KEY(frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS embeddings (
+          frame_id INTEGER PRIMARY KEY,
+          dim INTEGER NOT NULL,
+          vec BLOB NOT NULL,
+          FOREIGN KEY(frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_frames_job ON frames(job_id);
+        CREATE INDEX IF NOT EXISTS idx_det_label ON detections(label);
+        """)
+PY
+
+cat > "$APP_DIR/app/scenevault/minio_client.py" <<'PY'
+from minio import Minio
+from .config import MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET
+
+def client() -> Minio:
+    endpoint = MINIO_ENDPOINT.replace("http://","").replace("https://","")
+    secure = MINIO_ENDPOINT.startswith("https://")
+    return Minio(endpoint, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=secure)
+
+def ensure_bucket():
+    mc = client()
+    if not mc.bucket_exists(MINIO_BUCKET):
+        mc.make_bucket(MINIO_BUCKET)
+
+def put_file(object_name: str, file_path: str, content_type: str="application/gzip"):
+    mc = client()
+    ensure_bucket()
+    mc.fput_object(MINIO_BUCKET, object_name, file_path, content_type=content_type)
+
+def presign_get(object_name: str, expiry_seconds: int=3600):
+    mc = client()
+    ensure_bucket()
+    return mc.presigned_get_object(MINIO_BUCKET, object_name, expires=expiry_seconds)
+PY
+
+cat > "$APP_DIR/app/scenevault/jobs.py" <<'PY'
+from redis import Redis
+from rq import Queue
+from .config import REDIS_URL
+from .db import connect
+from .util import now_iso
+
+def q() -> Queue:
+    r = Redis.from_url(REDIS_URL)
+    return Queue("scenevault", connection=r)
+
+def create_job(job_id: str, input_name: str, input_type: str, frame_interval: float, do_colmap: int):
+    with connect() as c:
+        c.execute(
+            "INSERT INTO jobs(id, created_at, status, input_name, input_type, frame_interval, do_colmap, logs) VALUES (?,?,?,?,?,?,?,?)",
+            (job_id, now_iso(), "QUEUED", input_name, input_type, float(frame_interval), int(do_colmap), ""),
+        )
+
+def update_job(job_id: str, **fields):
+    if not fields:
+        return
+    cols, vals = [], []
+    for k,v in fields.items():
+        cols.append(f"{k}=?")
+        vals.append(v)
+    vals.append(job_id)
+    with connect() as c:
+        c.execute(f"UPDATE jobs SET {', '.join(cols)} WHERE id=?", tuple(vals))
+
+def get_job(job_id: str):
+    with connect() as c:
+        r = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return dict(r) if r else None
+
+def list_jobs(limit: int=50):
+    with connect() as c:
+        rows = c.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(x) for x in rows]
+PY
+
+cat > "$APP_DIR/app/scenevault/cliputil.py" <<'PY'
+from __future__ import annotations
+import numpy as np
+import torch
+from transformers import CLIPProcessor, CLIPModel
+from .config import CLIP_MODEL
+
+_MODEL = None
+_PROC = None
+
+def _get():
+    global _MODEL, _PROC
+    if _MODEL is None or _PROC is None:
+        _MODEL = CLIPModel.from_pretrained(CLIP_MODEL)
+        _PROC = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        _MODEL.eval()
+    return _MODEL, _PROC
+
+@torch.inference_mode()
+def embed_images(pil_images: list):
+    model, proc = _get()
+    inputs = proc(images=pil_images, return_tensors="pt")
+    feats = model.get_image_features(**inputs)
+    feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+    return feats.cpu().numpy().astype(np.float32)
+
+@torch.inference_mode()
+def embed_text(texts: list[str]):
+    model, proc = _get()
+    inputs = proc(text=texts, return_tensors="pt", padding=True)
+    feats = model.get_text_features(**inputs)
+    feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+    return feats.cpu().numpy().astype(np.float32)
+
+def pack_vec(v: np.ndarray) -> bytes:
+    return v.astype(np.float32).tobytes()
+
+def unpack_vec(b: bytes, dim: int) -> np.ndarray:
+    return np.frombuffer(b, dtype=np.float32, count=dim)
+PY
+
+cat > "$APP_DIR/app/scenevault/pipeline.py" <<'PY'
+from __future__ import annotations
+import io, json, zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+from ultralytics import YOLO
+
+from .config import YOLO_MODEL
+from .db import connect
+from .util import ensure_dir, run, sha256_file, jdump
+from .cliputil import embed_images, pack_vec
+
+def _save_frame_record(job_id: str, img_path: Path, w: int, h: int, digest: str) -> int:
+    with connect() as c:
+        cur = c.execute(
+            "INSERT INTO frames(job_id, path, width, height, sha256) VALUES (?,?,?,?,?)",
+            (job_id, str(img_path), int(w), int(h), digest),
+        )
+        return int(cur.lastrowid)
+
+def _save_detections(frame_id: int, dets: list[dict]):
+    with connect() as c:
+        for d in dets:
+            c.execute(
+                "INSERT INTO detections(frame_id,label,conf,x1,y1,x2,y2) VALUES (?,?,?,?,?,?,?)",
+                (frame_id, d["label"], float(d["conf"]), float(d["x1"]), float(d["y1"]), float(d["x2"]), float(d["y2"])),
+            )
+
+def _save_embedding(frame_id: int, vec: np.ndarray):
+    dim = int(vec.shape[0])
+    with connect() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO embeddings(frame_id, dim, vec) VALUES (?,?,?)",
+            (frame_id, dim, pack_vec(vec)),
+        )
+
+def extract_frames(video_path: Path, out_dir: Path, interval_sec: float) -> tuple[int,str]:
+    ensure_dir(out_dir)
+    # Extract frames every N seconds using fps=1/N
+    fps_expr = f"fps=1/{float(interval_sec)}"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(video_path), "-vf", fps_expr, str(out_dir / "frame_%06d.jpg")]
+    rc, out = run(cmd)
+    return rc, out
+
+def unzip_photos(zip_path: Path, out_dir: Path):
+    ensure_dir(out_dir)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        for n in z.namelist():
+            nn = n.lower()
+            if nn.endswith(".jpg") or nn.endswith(".jpeg") or nn.endswith(".png"):
+                dst = out_dir / Path(n).name
+                with z.open(n) as f:
+                    dst.write_bytes(f.read())
+
+def yolo_and_clip_index(job_id: str, frames_dir: Path, logs: list[str]) -> dict:
+    model = YOLO(YOLO_MODEL)
+    img_files = sorted([p for p in frames_dir.glob("*") if p.suffix.lower() in {".jpg",".jpeg",".png"}])
+
+    pil_batch = []
+    frame_ids = []
+    det_count = 0
+
+    for p in img_files:
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception:
+            continue
+
+        w, h = im.size
+        digest = sha256_file(p)
+        fid = _save_frame_record(job_id, p, w, h, digest)
+
+        # YOLO
+        r = model.predict(source=np.array(im), verbose=False)[0]
+        names = r.names
+        dets = []
+        if r.boxes is not None and len(r.boxes) > 0:
+            for b in r.boxes:
+                cls = int(b.cls.item())
+                conf = float(b.conf.item())
+                x1,y1,x2,y2 = [float(x) for x in b.xyxy[0].tolist()]
+                dets.append({"label": str(names.get(cls, cls)), "conf": conf, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        _save_detections(fid, dets)
+        det_count += len(dets)
+
+        pil_batch.append(im)
+        frame_ids.append(fid)
+
+        # CLIP in batches of 16
+        if len(pil_batch) >= 16:
+            embs = embed_images(pil_batch)
+            for _fid, vec in zip(frame_ids, embs):
+                _save_embedding(_fid, vec)
+            pil_batch, frame_ids = [], []
+
+    if pil_batch:
+        embs = embed_images(pil_batch)
+        for _fid, vec in zip(frame_ids, embs):
+            _save_embedding(_fid, vec)
+
+    logs.append(f"[index] frames={len(img_files)} detections={det_count}\n")
+    return {"frames": len(img_files), "detections": det_count}
+
+def try_colmap_reconstruct(frames_dir: Path, out_dir: Path, logs: list[str]) -> dict:
+    ensure_dir(out_dir)
+    img_dir = frames_dir
+    work = out_dir / "colmap"
+    ensure_dir(work)
+
+    db = work / "database.db"
+    sparse = work / "sparse"
+    ensure_dir(sparse)
+
+    # COLMAP pipeline (if installed)
+    # 1) feature_extractor
+    # 2) exhaustive_matcher
+    # 3) mapper
+    cmds = [
+        ["colmap", "feature_extractor", "--database_path", str(db), "--image_path", str(img_dir)],
+        ["colmap", "exhaustive_matcher", "--database_path", str(db)],
+        ["colmap", "mapper", "--database_path", str(db), "--image_path", str(img_dir), "--output_path", str(sparse)],
+    ]
+    for c in cmds:
+        rc, out = run(c)
+        logs.append(f"[colmap] cmd={' '.join(c)} rc={rc}\n{out}\n")
+        if rc != 0:
+            return {"enabled": True, "ok": False, "reason": "colmap command failed"}
+
+    # Export first model to PLY if possible
+    # model is in sparse/0 typically
+    model0 = sparse / "0"
+    ply = work / "sparse0.ply"
+    if model0.exists():
+        rc, out = run(["colmap", "model_converter", "--input_path", str(model0), "--output_path", str(ply), "--output_type", "PLY"])
+        logs.append(f"[colmap] model_converter rc={rc}\n{out}\n")
+        if rc == 0 and ply.exists():
+            return {"enabled": True, "ok": True, "ply": str(ply)}
+    return {"enabled": True, "ok": True, "ply": None}
+PY
+
+cat > "$APP_DIR/app/scenevault/worker.py" <<'PY'
+from __future__ import annotations
+import uuid, tarfile
+from pathlib import Path
+
+from rq import Worker
+from redis import Redis
+
+from .config import REDIS_URL, UPLOADS, WORK, ARTIFACTS
+from .jobs import get_job, update_job
+from .util import ensure_dir, sha256_file
+from .pipeline import extract_frames, unzip_photos, yolo_and_clip_index, try_colmap_reconstruct
+from .minio_client import put_file
+
+def process_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return
+
+    update_job(job_id, status="RUNNING")
+    logs = []
+    def log(s): logs.append(s if s.endswith("\n") else s+"\n")
+
+    try:
+        ensure_dir(UPLOADS); ensure_dir(WORK); ensure_dir(ARTIFACTS)
+
+        in_name = job["input_name"]
+        in_type = job["input_type"]
+        interval = float(job["frame_interval"])
+        do_colmap = int(job["do_colmap"])
+
+        in_path = (UPLOADS / in_name).resolve()
+        if not in_path.exists():
+            raise RuntimeError(f"missing upload: {in_path}")
+
+        out_dir = (WORK / job_id).resolve()
+        frames_dir = out_dir / "frames"
+        ensure_dir(out_dir); ensure_dir(frames_dir)
+
+        log(f"[scenevault] job={job_id}")
+        log(f"[scenevault] input={in_name} type={in_type}")
+        log(f"[scenevault] frame_interval={interval} do_colmap={do_colmap}")
+
+        if in_type == "video":
+            rc, out = extract_frames(in_path, frames_dir, interval)
+            log(f"[ffmpeg] rc={rc}\n{out}")
+            if rc != 0:
+                raise RuntimeError("ffmpeg failed to extract frames")
+        else:
+            unzip_photos(in_path, frames_dir)
+            log("[zip] extracted photos\n")
+
+        idx = yolo_and_clip_index(job_id, frames_dir, logs)
+
+        colmap_res = {"enabled": False}
+        if do_colmap == 1:
+            colmap_res = try_colmap_reconstruct(frames_dir, out_dir, logs)
+
+        # artifacts bundle
+        bundle = ARTIFACTS / f"{job_id}.tar.gz"
+        with tarfile.open(bundle, "w:gz") as tf:
+            tf.add(str(frames_dir), arcname="frames")
+            tf.add(str(out_dir), arcname="workdir")
+
+        digest = sha256_file(bundle)
+        object_key = f"{job_id}/bundle.tar.gz"
+        put_file(object_key, str(bundle), content_type="application/gzip")
+
+        update_job(
+            job_id,
+            status="SUCCEEDED",
+            logs="".join(logs),
+            artifact_key=object_key,
+            artifact_sha256=digest,
+        )
+
+    except Exception as e:
+        log(f"[scenevault][ERROR] {e}")
+        update_job(job_id, status="FAILED", logs="".join(logs))
+
+def main():
+    r = Redis.from_url(REDIS_URL)
+    w = Worker(["scenevault"], connection=r)
+    w.work(with_scheduler=False)
+
+if __name__ == "__main__":
+    main()
+PY
+
+cat > "$APP_DIR/app/scenevault/web.py" <<'PY'
+from __future__ import annotations
+import uuid
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+from fastapi import APIRouter, Request, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+
+from .config import UPLOADS
+from .jobs import q, create_job, list_jobs, get_job
+from .worker import process_job
+from .minio_client import presign_get
+from .db import connect
+from .cliputil import embed_text, unpack_vec
+
+BASE = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE / "templates"))
+router = APIRouter()
+
+def _cos(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))
+
+@router.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    jobs = list_jobs(100)
+    return templates.TemplateResponse("index.html", {"request": request, "jobs": jobs})
+
+@router.post("/create")
+async def create(
+    infile: UploadFile = File(...),
+    frame_interval: float = Form(1.0),
+    do_colmap: int = Form(0),
+):
+    job_id = uuid.uuid4().hex
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+
+    name = Path(infile.filename).name
+    low = name.lower()
+    if low.endswith(".zip"):
+        in_type = "photos_zip"
+    else:
+        in_type = "video"
+
+    safe_name = f"{job_id}__{name}"
+    dst = (UPLOADS / safe_name).resolve()
+    dst.write_bytes(await infile.read())
+
+    create_job(job_id, safe_name, in_type, float(frame_interval), int(do_colmap))
+    q().enqueue(process_job, job_id, job_id=job_id)
+
+    return RedirectResponse(url=f"/job/{job_id}", status_code=303)
+
+@router.get("/job/{job_id}", response_class=HTMLResponse)
+def job_page(request: Request, job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return HTMLResponse("Not found", status_code=404)
+
+    dl = None
+    if job.get("artifact_key") and job.get("status") == "SUCCEEDED":
+        dl = presign_get(job["artifact_key"], expiry_seconds=3600)
+
+    return templates.TemplateResponse("job.html", {"request": request, "job": job, "download_url": dl})
+
+@router.get("/search", response_class=HTMLResponse)
+def search(request: Request, qtext: str = "", label: str = "", limit: int = 30):
+    qtext = (qtext or "").strip()
+    label = (label or "").strip().lower()
+
+    hits = []
+    if qtext:
+        qv = embed_text([qtext])[0]
+        with connect() as c:
+            rows = c.execute("""
+              SELECT f.id as frame_id, f.path, e.dim, e.vec
+              FROM frames f
+              JOIN embeddings e ON e.frame_id = f.id
+              ORDER BY f.id DESC
+              LIMIT 5000
+            """).fetchall()
+
+            scored = []
+            for r in rows:
+                v = unpack_vec(r["vec"], int(r["dim"]))
+                s = _cos(qv, v)
+                scored.append((s, int(r["frame_id"]), r["path"]))
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+        # label filter (post)
+        for s, fid, p in scored[: max(limit*5, limit)]:
+            if label:
+                with connect() as c:
+                    rr = c.execute("SELECT 1 FROM detections WHERE frame_id=? AND lower(label) LIKE ? LIMIT 1", (fid, f"%{label}%")).fetchone()
+                if not rr:
+                    continue
+            hits.append({"score": float(round(s, 6)), "frame_id": fid, "path": p})
+            if len(hits) >= limit:
+                break
+
+    return templates.TemplateResponse("search.html", {"request": request, "qtext": qtext, "label": label, "hits": hits})
+PY
+
+cat > "$APP_DIR/app/scenevault/main.py" <<'PY'
+from fastapi import FastAPI
+from .db import init_db
+from .web import router
+
+init_db()
+app = FastAPI(title="SceneVault")
+app.include_router(router)
+PY
+
+cat > "$APP_DIR/app/scenevault/templates/index.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SceneVault</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    input,select,button{font-size:14px;padding:10px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;margin-top:14px}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #ddd;border-radius:999px;font-size:12px}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <h1>SceneVault</h1>
+  <p>Upload phone video/photos → frames + YOLO + CLIP (+ optional COLMAP) → search.</p>
+
+  <div class="card">
+    <h3>Create job</h3>
+    <form method="post" action="/create" enctype="multipart/form-data">
+      <div style="margin-bottom:10px">
+        <input type="file" name="infile" accept=".mp4,.mov,.zip" required>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <label>Frame interval (seconds, video):</label>
+        <input name="frame_interval" type="number" min="0.2" step="0.2" value="1.0" style="width:140px">
+        <label>Enable COLMAP 3D:</label>
+        <select name="do_colmap">
+          <option value="0">no</option>
+          <option value="1">yes</option>
+        </select>
+      </div>
+      <button type="submit">Ingest</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Search</h3>
+    <form method="get" action="/search">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <input name="qtext" placeholder="text query e.g. cables, chair, desk..." style="flex:1;min-width:320px">
+        <input name="label" placeholder="label filter (optional) e.g. chair" style="min-width:260px">
+        <button type="submit">Search</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Jobs</h3>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Input</th><th>Type</th><th>Status</th><th>Created</th></tr>
+      </thead>
+      <tbody>
+        {% for j in jobs %}
+          <tr>
+            <td><a href="/job/{{j.id}}">{{j.id[:10]}}…</a></td>
+            <td>{{j.input_name}}</td>
+            <td>{{j.input_type}}</td>
+            <td><span class="pill">{{j.status}}</span></td>
+            <td>{{j.created_at}}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+HTML
+
+cat > "$APP_DIR/app/scenevault/templates/job.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SceneVault Job</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;margin-top:14px}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:12px;border-radius:12px}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #ddd;border-radius:999px;font-size:12px}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <a href="/">← back</a>
+  <h1>Job {{job.id}}</h1>
+
+  <div class="card">
+    <div><b>Status:</b> <span class="pill">{{job.status}}</span></div>
+    <div><b>Input:</b> {{job.input_name}}</div>
+    <div><b>Type:</b> {{job.input_type}}</div>
+    <div><b>Frame interval:</b> {{job.frame_interval}}</div>
+    <div><b>COLMAP:</b> {{job.do_colmap}}</div>
+
+    {% if job.artifact_sha256 %}
+      <div><b>Bundle sha256:</b> {{job.artifact_sha256}}</div>
+    {% endif %}
+
+    {% if download_url %}
+      <div style="margin-top:10px"><b>Download bundle (1h link):</b> <a href="{{download_url}}">download</a></div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>Logs</h3>
+    <pre>{{job.logs}}</pre>
+  </div>
+
+  <script>
+    const st = "{{job.status}}";
+    if(st === "QUEUED" || st === "RUNNING"){
+      setTimeout(()=>location.reload(), 1500);
+    }
+  </script>
+</body>
+</html>
+HTML
+
+cat > "$APP_DIR/app/scenevault/templates/search.html" <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SceneVault Search</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1200px}
+    input,button{font-size:14px;padding:10px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;margin-top:14px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #ddd;border-radius:999px;font-size:12px}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:8px}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <a href="/">← back</a>
+  <h1>Search</h1>
+
+  <div class="card">
+    <form method="get" action="/search" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+      <input name="qtext" value="{{qtext}}" placeholder="text query" style="flex:1;min-width:320px">
+      <input name="label" value="{{label}}" placeholder="label filter (optional)" style="min-width:260px">
+      <button type="submit">Search</button>
+    </form>
+    <div style="margin-top:8px">
+      <span class="pill">hits={{hits|length}}</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    {% for h in hits %}
+      <div class="card">
+        <div><b>score</b> {{h.score}}</div>
+        <div><b>frame_id</b> {{h.frame_id}}</div>
+        <div style="margin-top:6px"><code>{{h.path}}</code></div>
+      </div>
+    {% endfor %}
+  </div>
+</body>
+</html>
+HTML
+
+echo "✅ Created: $APP_DIR"
+echo
+echo "Run:"
+echo "  cd $APP_DIR && docker compose up --build"
+echo
+echo "Open UI:"
+echo "  http://localhost:${PORT}"
+echo
+echo "MinIO Console:"
+echo "  http://localhost:9021  (S3: http://localhost:9020)"
+echo "  user=${MINIO_ROOT_USER}"
